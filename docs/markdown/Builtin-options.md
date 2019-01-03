@@ -15,6 +15,8 @@ these can be set by passing to `meson` (aka `meson setup`) in any of
 these ways: `--option=value`, `--option value`, `-Doption=value`, or
 by setting them inside `default_options` of `project()` in your `meson.build`.
 
+For legacy reasons `--warnlevel` is the cli argument for the `warning_level` option.
+
 They can also be edited after setup using `meson configure`.
 
 Installation options are all relative to the prefix, except:
@@ -38,7 +40,7 @@ Installation options are all relative to the prefix, except:
 | localstatedir                        | var           | Localstate data directory |
 | sharedstatedir                       | com           | Architecture-independent data directory |
 | werror                               | false         | Treat warnings as errors |
-| warnlevel {1, 2, 3}                  | 1             | Set the warning level. From 1 = lowest to 3 = highest |
+| warning_level {1, 2, 3}              | 1             | Set the warning level. From 1 = lowest to 3 = highest |
 | layout {mirror,flat}                 | mirror        | Build directory layout. |
 | default-library {shared, static, both} | shared       | Default library type. |
 | backend {ninja, vs,<br>vs2010, vs2015, vs2017, xcode} |               | Backend to use (default: ninja). |
