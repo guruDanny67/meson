@@ -28,6 +28,11 @@ class Vs2019Backend(Vs2010Backend):
         sdk_version = os.environ.get('WindowsSDKVersion', None)
         if sdk_version:
             self.windows_target_platform_version = sdk_version.rstrip('\\')
+        else:
+            # Try with 8.1
+            sdk_version = os.environ.get('WindowsSDKLibVersion', None)
+            if sdk_version == 'winv6.3\\':
+                self.windows_target_platform_version = '8.1'
 
     def generate_debug_information(self, link):
         # valid values for vs2019 is 'false', 'true', 'DebugFastLink', 'DebugFull'
