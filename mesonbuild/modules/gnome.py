@@ -29,7 +29,9 @@ from . import GResourceTarget, GResourceHeaderTarget, GirTarget, TypelibTarget, 
 from . import get_include_args
 from . import ExtensionModule
 from . import ModuleReturnValue
-from ..mesonlib import MesonException, OrderedSet, Popen_safe, extract_as_list
+from ..mesonlib import (
+    MachineChoice, MesonException, OrderedSet, Popen_safe, extract_as_list
+)
 from ..dependencies import Dependency, PkgConfigDependency, InternalDependency
 from ..interpreterbase import noKwargs, permittedKwargs, FeatureNew, FeatureNewKwargs
 
@@ -531,11 +533,7 @@ class GnomeModule(ExtensionModule):
         ret = []
 
         for lang in langs:
-            if state.environment.is_cross_build():
-                link_args = state.environment.cross_info.config["properties"].get(lang + '_link_args', "")
-            else:
-                link_args = state.environment.coredata.get_external_link_args(lang)
-
+            link_args = state.environment.coredata.get_external_link_args(MachineChoice.HOST, lang)
             for link_arg in link_args:
                 if link_arg.startswith('-L'):
                     ret.append(link_arg)
@@ -607,9 +605,15 @@ class GnomeModule(ExtensionModule):
             if 'b_sanitize' in compiler.base_options:
                 sanitize = state.environment.coredata.base_options['b_sanitize'].value
                 cflags += compilers.sanitizer_compile_args(sanitize)
-                if 'address' in sanitize.split(','):
-                    internal_ldflags += ['-lasan']  # This must be first in ldflags
-                # FIXME: Linking directly to libasan is not recommended but g-ir-scanner
+                sanitize = sanitize.split(',')
+                # These must be first in ldflags
+                if 'address' in sanitize:
+                    internal_ldflags += ['-lasan']
+                if 'thread' in sanitize:
+                    internal_ldflags += ['-ltsan']
+                if 'undefined' in sanitize:
+                    internal_ldflags += ['-lubsan']
+                # FIXME: Linking directly to lib*san is not recommended but g-ir-scanner
                 # does not understand -f LDFLAGS. https://bugzilla.gnome.org/show_bug.cgi?id=783892
                 # ldflags += compilers.sanitizer_link_args(sanitize)
 
@@ -714,10 +718,7 @@ class GnomeModule(ExtensionModule):
     def _get_external_args_for_langs(self, state, langs):
         ret = []
         for lang in langs:
-            if state.environment.is_cross_build():
-                ret += state.environment.cross_info.config["properties"].get(lang + '_args', "")
-            else:
-                ret += state.environment.coredata.get_external_args(lang)
+            ret += state.environment.coredata.get_external_args(MachineChoice.HOST, lang)
         return ret
 
     @staticmethod
@@ -1042,13 +1043,11 @@ This will become a hard error in the future.''')
         ldflags.update(internal_ldflags)
         ldflags.update(external_ldflags)
 
+        cflags.update(state.environment.coredata.get_external_args(MachineChoice.HOST, 'c'))
+        ldflags.update(state.environment.coredata.get_external_link_args(MachineChoice.HOST, 'c'))
         if state.environment.is_cross_build():
-            cflags.update(state.environment.cross_info.config["properties"].get('c_args', ""))
-            ldflags.update(state.environment.cross_info.config["properties"].get('c_link_args', ""))
             compiler = state.environment.coredata.cross_compilers.get('c')
         else:
-            cflags.update(state.environment.coredata.get_external_args('c'))
-            ldflags.update(state.environment.coredata.get_external_link_args('c'))
             compiler = state.environment.coredata.compilers.get('c')
 
         compiler_flags = self._get_langs_compilers_flags(state, [('c', compiler)])

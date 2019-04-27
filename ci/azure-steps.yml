@@ -5,8 +5,8 @@ steps:
         exit 0
      }
 
-     # remove MinGW from path, so we don't find gfortran and try to use it
-     $env:Path = ($env:Path.Split(';') | Where-Object { $_ -notlike '*mingw*' }) -join ';'
+     # remove Chocolately, MinGW, Strawberry Perl from path, so we don't find gcc/gfortran and try to use it
+     $env:Path = ($env:Path.Split(';') | Where-Object { $_ -notmatch 'mingw|Strawberry|Chocolatey' }) -join ';'
 
      # download and install prerequisites
      function DownloadFile([String] $Source, [String] $Destination) {
@@ -71,6 +71,8 @@ steps:
        Start-Process "boost_$boost_filename-msvc-$boost_abi_tag-$boost_bitness.exe" -ArgumentList "/dir=$(System.WorkFolder)\boost_$boost_filename /silent" -Wait
        $env:BOOST_ROOT = "$(System.WorkFolder)\boost_$boost_filename"
        $env:Path = "$env:Path;$env:BOOST_ROOT\lib$boost_bitness-msvc-$boost_abi_tag"
+     } else {
+       $env:BOOST_ROOT = ""
      }
 
      # install D compiler and dub packages
@@ -97,6 +99,8 @@ steps:
      # import visual studio variables
      if ($env:compiler -eq 'msvc2015') {
        $vcvars = "C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\vcvarsall.bat"
+     } elseif($env:compiler -eq 'msvc2019') {
+       $vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
      } else {
        $vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2017\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
      }
@@ -142,10 +146,20 @@ steps:
        MSBuild /version
      }
 
+     echo "=== PATH BEGIN ==="
+     echo ($env:Path).Replace(';',"`n")
+     echo "=== PATH END ==="
+     echo ""
+     echo "Locating Python:"
      where.exe python
      python --version
 
-     python run_tests.py --backend $(backend)
+     echo ""
+     echo "=== Start running tests ==="
+     # Starting from VS2019 Powershell(?) will fail the test run
+     # if it prints anything to stderr. Python's test runner
+     # does that by default so we need to forward it.
+     cmd /c 'python 2>&1' run_tests.py --backend $(backend)
 
 - task: PublishTestResults@2
   inputs:
@@ -163,5 +177,4 @@ steps:
 - task: PublishBuildArtifacts@1
   inputs:
     artifactName: $(System.JobName)
-  # publishing artifacts from PRs from a fork is currently blocked
-  condition: eq(variables['system.pullrequest.isfork'], false)
+  condition: not(canceled())

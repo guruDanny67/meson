@@ -24,30 +24,23 @@ Installation options are all relative to the prefix, except:
 * When the prefix is `/usr`: `sysconfdir` defaults to `/etc`, `localstatedir` defaults to `/var`, and `sharedstatedir` defaults to `/var/lib`
 * When the prefix is `/usr/local`: `localstatedir` defaults to `/var/local`, and `sharedstatedir` defaults to `/var/local/lib`
 
+### Directories
+
 | Option                               | Default value | Description |
 | ------                               | ------------- | ----------- |
 | prefix                               | see below     | Installation prefix |
+| bindir                               | bin           | Executable directory |
+| datadir                              | share         | Data file directory |
+| includedir                           | include       | Header file directory |
+| infodir                              | share/info    | Info page directory |
 | libdir                               | see below     | Library directory |
 | libexecdir                           | libexec       | Library executable directory |
-| bindir                               | bin           | Executable directory |
-| sbindir                              | sbin          | System executable directory |
-| includedir                           | include       | Header file directory |
-| datadir                              | share         | Data file directory |
-| mandir                               | share/man     | Manual page directory |
-| infodir                              | share/info    | Info page directory |
 | localedir                            | share/locale  | Locale data directory |
-| sysconfdir                           | etc           | Sysconf data directory |
 | localstatedir                        | var           | Localstate data directory |
+| mandir                               | share/man     | Manual page directory |
+| sbindir                              | sbin          | System executable directory |
 | sharedstatedir                       | com           | Architecture-independent data directory |
-| werror                               | false         | Treat warnings as errors |
-| warning_level {1, 2, 3}              | 1             | Set the warning level. From 1 = lowest to 3 = highest |
-| layout {mirror,flat}                 | mirror        | Build directory layout. |
-| default-library {shared, static, both} | shared       | Default library type. |
-| backend {ninja, vs,<br>vs2010, vs2015, vs2017, xcode} |               | Backend to use (default: ninja). |
-| stdsplit                             |               | Split stdout and stderr in test logs. |
-| errorlogs                            |               | Whether to print the logs from failing tests. |
-| cross-file CROSS_FILE                |               | File describing cross compilation environment. |
-| wrap-mode {default, nofallback, nodownload, forcefallback} | | Special wrap mode to use |
+| sysconfdir                           | etc           | Sysconf data directory |
 
 
 `prefix` defaults to `C:/` on Windows, and `/usr/local/` otherwise. You should always
@@ -57,9 +50,32 @@ override this value.
 implementation is [currently buggy](https://github.com/mesonbuild/meson/issues/2038)
 on Linux platforms.
 
-There are various other options to set, for instance the backend to use and
-the path to the cross-file while cross compiling, which won't be repeated here.
-Please see the output of `meson --help`.
+### Core options
+
+Options that have a separate cross option will be prefixed with
+cross\_, for example, "cross_pkg_config_path" controls the paths
+pkg-config will search for host dependencies in a cross compile.
+They have no effect when the host and build machines are the same.
+
+
+| Option                               | Default value | Description                                                    | Has Separate cross |
+| ------                               | ------------- | -----------                                                    | ------------------ |
+| auto_features {enabled, disabled, auto} | auto       | Override value of all 'auto' features                          | no                 |
+| backend {ninja, vs,<br>vs2010, vs2015, vs2017, xcode} | ninja | Backend to use                                        | no                 |
+| buildtype {plain, debug,<br>debugoptimized, release, minsize, custom} | debug |  Build type to use                    | no                 |
+| debug                                | true          | Debug                                                          | no                 |
+| default_library {shared, static, both} | shared      | Default library type                                           | no                 |
+| errorlogs                            | true          | Whether to print the logs from failing tests.                  | no                 |
+| install_umask {preserve, 0000-0777}  | 022           | Default umask to apply on permissions of installed files       | no                 |
+| layout {mirror,flat}                 | mirror        | Build directory layout                                         | no                 |
+| optimization {0, g, 1, 2, 3, s}      | 0             | Optimization level                                             | no                 |
+| pkg_config_path {OS separated path}  | ''            | Additional paths for pkg-config to search before builtin paths | yes                |
+| stdsplit                             | true          | Split stdout and stderr in test logs                           | no                 |
+| strip                                | false         | Strip targets on install                                       | no                 |
+| unity {on, off, subprojects}         | off           | Unity build                                                    | no                 |
+| warning_level {0, 1, 2, 3}           | 1             | Set the warning level. From 0 = none to 3 = highest            | no                 |
+| werror                               | false         | Treat warnings as errors                                       | no                 |
+| wrap_mode {default, nofallback,<br>nodownload, forcefallback} | default | Wrap mode to use                            | no                 |
 
 ## Base options
 
@@ -77,7 +93,6 @@ platforms or with all compilers:
 | b_bitcode   | false         | true, false             | Embed Apple bitcode, see below |
 | b_colorout  | always        | auto, always, never     | Use colored output |
 | b_coverage  | false         | true, false             | Enable coverage tracking |
-| b_vscrt     | from_buildtype| none, md, mdd, mt, mtd, from_buildtype | VS runtime library to use (since 0.48.0) |
 | b_lundef    | true          | true, false             | Don't allow undefined symbols when linking |
 | b_lto       | false         | true, false             | Use link time optimization |
 | b_ndebug    | false         | true, false, if-release | Disable asserts |
@@ -86,6 +101,7 @@ platforms or with all compilers:
 | b_sanitize  | none          | see below               | Code sanitizer to use |
 | b_staticpic | true          | true, false             | Build static libraries as position independent |
 | b_pie       | false         | true, false             | Build position-independent executables (since 0.49.0)|
+| b_vscrt     | from_buildtype| none, md, mdd, mt, mtd, from_buildtype | VS runtime library to use (since 0.48.0) |
 
 The value of `b_sanitize` can be one of: `none`, `address`, `thread`,
 `undefined`, `memory`, `address,undefined`.
@@ -112,7 +128,7 @@ compiler being used:
 | ------       | ------------- | ---------------                          | ----------- |
 | c_args       |               | free-form comma-separated list           | C compile arguments to use |
 | c_link_args  |               | free-form comma-separated list           | C link arguments to use |
-| c_std        | none          | none, c89, c99, c11, gnu89, gnu99, gnu11 | C language standard to use |
+| c_std        | none          | none, c89, c99, c11, c17, c18, gnu89, gnu99, gnu11, gnu17, gnu18 | C language standard to use |
 | c_winlibs    | see below     | free-form comma-separated list           | Standard Windows libs to link against |
 | cpp_args     |               | free-form comma-separated list           | C++ compile arguments to use |
 | cpp_link_args|               | free-form comma-separated list           | C++ link arguments to use |

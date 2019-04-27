@@ -1,4 +1,4 @@
-# Copyright 2012-2018 The Meson development team
+# Copyright 2012-2019 The Meson development team
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,15 +19,17 @@ from itertools import chain
 from pathlib import PurePath
 from collections import OrderedDict
 from .mesonlib import (
-    MesonException, default_libdir, default_libexecdir, default_prefix
+    MesonException, MachineChoice, PerMachine,
+    default_libdir, default_libexecdir, default_prefix, stringlistify
 )
 from .wrap import WrapMode
 import ast
 import argparse
 import configparser
+from typing import Optional, Any, TypeVar, Generic, Type, List
 
-version = '0.49.999'
-backendlist = ['ninja', 'vs', 'vs2010', 'vs2015', 'vs2017', 'xcode']
+version = '0.50.999'
+backendlist = ['ninja', 'vs', 'vs2010', 'vs2015', 'vs2017', 'vs2019', 'xcode']
 
 default_yielding = False
 
@@ -42,6 +44,9 @@ class UserOption:
         if not isinstance(yielding, bool):
             raise MesonException('Value of "yielding" must be a boolean.')
         self.yielding = yielding
+
+    def printable_value(self):
+        return self.value
 
     # Check that the input is a valid value and return the
     # "cleaned" or "native" version. For example the Boolean
@@ -114,9 +119,14 @@ class UserUmaskOption(UserIntegerOption):
         super().__init__(name, description, 0, 0o777, value, yielding)
         self.choices = ['preserve', '0000-0777']
 
+    def printable_value(self):
+        if self.value == 'preserve':
+            return self.value
+        return format(self.value, '04o')
+
     def validate_value(self, value):
         if value is None or value == 'preserve':
-            return None
+            return 'preserve'
         return super().validate_value(value)
 
     def toint(self, valuestring):
@@ -202,69 +212,11 @@ class UserFeatureOption(UserComboOption):
         return self.value == 'auto'
 
 
-def load_configs(filenames):
-    """Load native files."""
-    def gen():
-        for f in filenames:
-            f = os.path.expanduser(os.path.expandvars(f))
-            if os.path.exists(f):
-                yield f
-                continue
-            elif sys.platform != 'win32':
-                f = os.path.basename(f)
-                paths = [
-                    os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')),
-                ] + os.environ.get('XDG_DATA_DIRS', '/usr/local/share:/usr/share').split(':')
-                for path in paths:
-                    path_to_try = os.path.join(path, 'meson', 'native', f)
-                    if os.path.isfile(path_to_try):
-                        yield path_to_try
-                        break
-                else:
-                    raise MesonException('Cannot find specified native file: ' + f)
-                continue
-
-            raise MesonException('Cannot find specified native file: ' + f)
-
-    config = configparser.SafeConfigParser()
-    config.read(gen())
+def load_configs(filenames: List[str]) -> configparser.ConfigParser:
+    """Load configuration files from a named subdirectory."""
+    config = configparser.ConfigParser()
+    config.read(filenames)
     return config
-
-
-def _get_section(config, section):
-    if config.has_section(section):
-        final = {}
-        for k, v in config.items(section):
-            # Windows paths...
-            v = v.replace('\\', '\\\\')
-            try:
-                final[k] = ast.literal_eval(v)
-            except SyntaxError:
-                raise MesonException(
-                    'Malformed value in native file variable: {}'.format(v))
-        return final
-    return {}
-
-
-class ConfigData:
-
-    """Contains configuration information provided by the user for the build."""
-
-    def __init__(self, config=None):
-        if config:
-            self.binaries = _get_section(config, 'binaries')
-            # global is a keyword and globals is a builtin, rather than mangle it,
-            # use a similar word
-            self.universal = _get_section(config, 'globals')
-            self.subprojects = {s: _get_section(config, s) for s in config.sections()
-                                if s not in {'binaries', 'globals'}}
-        else:
-            self.binaries = {}
-            self.universal = {}
-            self.subprojects = {}
-
-    def get_binaries(self, name):
-        return self.binaries.get(name, None)
 
 
 # This class contains all data that must persist over multiple
@@ -289,71 +241,50 @@ class CoreData:
         self.init_builtins()
         self.backend_options = {}
         self.user_options = {}
-        self.compiler_options = {}
+        self.compiler_options = PerMachine({}, {}, {})
         self.base_options = {}
-        self.external_preprocess_args = {} # CPPFLAGS only
-        self.cross_file = self.__load_cross_file(options.cross_file)
+        self.cross_files = self.__load_config_files(options.cross_file, 'cross')
         self.compilers = OrderedDict()
         self.cross_compilers = OrderedDict()
         self.deps = OrderedDict()
         # Only to print a warning if it changes between Meson invocations.
-        self.pkgconf_envvar = os.environ.get('PKG_CONFIG_PATH', '')
-        self.config_files = self.__load_config_files(options.native_file)
+        self.config_files = self.__load_config_files(options.native_file, 'native')
         self.libdir_cross_fixup()
 
     @staticmethod
-    def __load_config_files(filenames):
+    def __load_config_files(filenames: Optional[List[str]], ftype: str) -> List[str]:
+        # Need to try and make the passed filenames absolute because when the
+        # files are parsed later we'll have chdir()d.
         if not filenames:
             return []
-        filenames = [os.path.abspath(os.path.expanduser(os.path.expanduser(f)))
-                     for f in filenames]
-        return filenames
 
-    @staticmethod
-    def __load_cross_file(filename):
-        """Try to load the cross file.
+        real = []
+        for f in filenames:
+            f = os.path.expanduser(os.path.expandvars(f))
+            if os.path.exists(f):
+                real.append(os.path.abspath(f))
+                continue
+            elif sys.platform != 'win32':
+                paths = [
+                    os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')),
+                ] + os.environ.get('XDG_DATA_DIRS', '/usr/local/share:/usr/share').split(':')
+                for path in paths:
+                    path_to_try = os.path.join(path, 'meson', ftype, f)
+                    if os.path.isfile(path_to_try):
+                        real.append(path_to_try)
+                        break
+                else:
+                    raise MesonException('Cannot find specified {} file: {}'.format(ftype, f))
+                continue
 
-        If the filename is None return None. If the filename is an absolute
-        (after resolving variables and ~), return that absolute path. Next,
-        check if the file is relative to the current source dir. If the path
-        still isn't resolved do the following:
-            Windows:
-                - Error
-            *:
-                - $XDG_DATA_HOME/meson/cross (or ~/.local/share/meson/cross if
-                  undefined)
-                - $XDG_DATA_DIRS/meson/cross (or
-                  /usr/local/share/meson/cross:/usr/share/meson/cross if undefined)
-                - Error
-
-        Non-Windows follows the Linux path and will honor XDG_* if set. This
-        simplifies the implementation somewhat.
-        """
-        if filename is None:
-            return None
-        filename = os.path.expanduser(os.path.expandvars(filename))
-        if os.path.isabs(filename):
-            return filename
-        path_to_try = os.path.abspath(filename)
-        if os.path.isfile(path_to_try):
-            return path_to_try
-        if sys.platform != 'win32':
-            paths = [
-                os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')),
-            ] + os.environ.get('XDG_DATA_DIRS', '/usr/local/share:/usr/share').split(':')
-            for path in paths:
-                path_to_try = os.path.join(path, 'meson', 'cross', filename)
-                if os.path.isfile(path_to_try):
-                    return path_to_try
-            raise MesonException('Cannot find specified cross file: ' + filename)
-
-        raise MesonException('Cannot find specified cross file: ' + filename)
+            raise MesonException('Cannot find specified {} file: {}'.format(ftype, f))
+        return real
 
     def libdir_cross_fixup(self):
         # By default set libdir to "lib" when cross compiling since
         # getting the "system default" is always wrong on multiarch
         # platforms as it gets a value like lib/x86_64-linux-gnu.
-        if self.cross_file is not None:
+        if self.cross_files:
             self.builtins['libdir'].value = 'lib'
 
     def sanitize_prefix(self, prefix):
@@ -401,11 +332,10 @@ class CoreData:
     def init_builtins(self):
         # Create builtin options with default values
         self.builtins = {}
-        prefix = get_builtin_option_default('prefix')
-        for key in get_builtin_options():
-            value = get_builtin_option_default(key, prefix)
-            args = [key] + builtin_options[key][1:-1] + [value]
-            self.builtins[key] = builtin_options[key][0](*args)
+        for key, opt in builtin_options.items():
+            self.builtins[key] = opt.init_option(key)
+            if opt.separate_cross:
+                self.builtins['cross_' + key] = opt.init_option(key)
 
     def init_backend_options(self, backend_name):
         if backend_name == 'ninja':
@@ -485,16 +415,18 @@ class CoreData:
             mode = 'custom'
         self.builtins['buildtype'].set_value(mode)
 
+    def get_all_compiler_options(self):
+        # TODO think about cross and command-line interface. (Only .build is mentioned here.)
+        yield self.compiler_options.build
+
     def _get_all_nonbuiltin_options(self):
         yield self.backend_options
         yield self.user_options
-        yield self.compiler_options
+        yield from self.get_all_compiler_options()
         yield self.base_options
 
     def get_all_options(self):
-        return chain(
-            iter([self.builtins]),
-            self._get_all_nonbuiltin_options())
+        return chain([self.builtins], self._get_all_nonbuiltin_options())
 
     def validate_option_value(self, option_name, override_value):
         for opts in self.get_all_options():
@@ -503,14 +435,11 @@ class CoreData:
                 return opt.validate_value(override_value)
         raise MesonException('Tried to validate unknown option %s.' % option_name)
 
-    def get_external_args(self, lang):
-        return self.compiler_options[lang + '_args'].value
+    def get_external_args(self, for_machine: MachineChoice, lang):
+        return self.compiler_options[for_machine][lang + '_args'].value
 
-    def get_external_link_args(self, lang):
-        return self.compiler_options[lang + '_link_args'].value
-
-    def get_external_preprocess_args(self, lang):
-        return self.external_preprocess_args[lang]
+    def get_external_link_args(self, for_machine: MachineChoice, lang):
+        return self.compiler_options[for_machine][lang + '_link_args'].value
 
     def merge_user_options(self, options):
         for (name, value) in options.items():
@@ -521,7 +450,7 @@ class CoreData:
                 if type(oldval) != type(value):
                     self.user_options[name] = value
 
-    def set_options(self, options, subproject=''):
+    def set_options(self, options, subproject='', warn_unknown=True):
         # Set prefix first because it's needed to sanitize other options
         prefix = self.builtins['prefix'].value
         if 'prefix' in options:
@@ -529,7 +458,7 @@ class CoreData:
             self.builtins['prefix'].set_value(prefix)
             for key in builtin_dir_noprefix_options:
                 if key not in options:
-                    self.builtins[key].set_value(get_builtin_option_default(key, prefix))
+                    self.builtins[key].set_value(builtin_options[key].prefixed_default(key, prefix))
 
         unknown_options = []
         for k, v in options.items():
@@ -545,22 +474,27 @@ class CoreData:
                         break
                 else:
                     unknown_options.append(k)
-
-        if unknown_options:
+        if unknown_options and warn_unknown:
             unknown_options = ', '.join(sorted(unknown_options))
             sub = 'In subproject {}: '.format(subproject) if subproject else ''
             mlog.warning('{}Unknown options: "{}"'.format(sub, unknown_options))
 
-    def set_default_options(self, default_options, subproject, cmd_line_options):
+    def set_default_options(self, default_options, subproject, env):
+        # Set defaults first from conf files (cross or native), then
+        # override them as nec as necessary.
+        for k, v in env.paths.host:
+            if v is not None:
+                env.cmd_line_options.setdefault(k, v)
+
         # Set default options as if they were passed to the command line.
         # Subprojects can only define default for user options.
         from . import optinterpreter
         for k, v in default_options.items():
             if subproject:
-                if optinterpreter.is_invalid_name(k):
+                if optinterpreter.is_invalid_name(k, log=False):
                     continue
                 k = subproject + ':' + k
-            cmd_line_options.setdefault(k, v)
+            env.cmd_line_options.setdefault(k, v)
 
         # Create a subset of cmd_line_options, keeping only options for this
         # subproject. Also take builtin options if it's the main project.
@@ -568,18 +502,70 @@ class CoreData:
         # languages and setting the backend (builtin options must be set first
         # to know which backend we'll use).
         options = {}
-        for k, v in cmd_line_options.items():
+
+        # Some options default to environment variables if they are
+        # unset, set those now. These will either be overwritten
+        # below, or they won't.
+        options['pkg_config_path'] = os.environ.get('PKG_CONFIG_PATH', '').split(':')
+
+        for k, v in env.cmd_line_options.items():
             if subproject:
                 if not k.startswith(subproject + ':'):
                     continue
-            elif k not in get_builtin_options():
+            elif k not in builtin_options:
                 if ':' in k:
                     continue
-                if optinterpreter.is_invalid_name(k):
+                if optinterpreter.is_invalid_name(k, log=False):
                     continue
             options[k] = v
 
         self.set_options(options, subproject)
+
+    def process_new_compilers(self, lang: str, comp, cross_comp, env):
+        from . import compilers
+
+        self.compilers[lang] = comp
+        if cross_comp is not None:
+            self.cross_compilers[lang] = cross_comp
+
+        # Native compiler always exist so always add its options.
+        new_options_for_build = comp.get_and_default_options(env.properties.build)
+        if cross_comp is not None:
+            new_options_for_host = cross_comp.get_and_default_options(env.properties.host)
+        else:
+            new_options_for_host = new_options_for_build
+
+        opts_machines_list = [
+            (new_options_for_build, MachineChoice.BUILD),
+            (new_options_for_host, MachineChoice.HOST),
+        ]
+
+        optprefix = lang + '_'
+        for new_options, for_machine in opts_machines_list:
+            for k, o in new_options.items():
+                if not k.startswith(optprefix):
+                    raise MesonException('Internal error, %s has incorrect prefix.' % k)
+                if (env.machines.matches_build_machine(for_machine) and
+                        k in env.cmd_line_options):
+                    # TODO think about cross and command-line interface.
+                    o.set_value(env.cmd_line_options[k])
+                self.compiler_options[for_machine].setdefault(k, o)
+
+        enabled_opts = []
+        for optname in comp.base_options:
+            if optname in self.base_options:
+                continue
+            oobj = compilers.base_options[optname]
+            if optname in env.cmd_line_options:
+                oobj.set_value(env.cmd_line_options[optname])
+                enabled_opts.append(optname)
+            self.base_options[optname] = oobj
+        self.emit_base_options_warnings(enabled_opts)
+
+    def emit_base_options_warnings(self, enabled_opts: list):
+        if 'b_bitcode' in enabled_opts:
+            mlog.warning('Base option \'b_bitcode\' is enabled, which is incompatible with many linker options. Incompatible options such as such as \'b_asneeded\' have been disabled.')
+            mlog.warning('Please see https://mesonbuild.com/Builtin-options.html#Notes_about_Apple_Bitcode_support for more details.')
 
 class CmdLineFileParser(configparser.ConfigParser):
     def __init__(self):
@@ -602,16 +588,22 @@ def read_cmd_line_file(build_dir, options):
     options.cmd_line_options = d
 
     properties = config['properties']
-    if options.cross_file is None:
-        options.cross_file = properties.get('cross_file', None)
+    if not options.cross_file:
+        options.cross_file = ast.literal_eval(properties.get('cross_file', '[]'))
+    if not options.native_file:
+        # This will be a string in the form: "['first', 'second', ...]", use
+        # literal_eval to get it into the list of strings.
+        options.native_file = ast.literal_eval(properties.get('native_file', '[]'))
 
 def write_cmd_line_file(build_dir, options):
     filename = get_cmd_line_file(build_dir)
     config = CmdLineFileParser()
 
     properties = {}
-    if options.cross_file is not None:
+    if options.cross_file:
         properties['cross_file'] = options.cross_file
+    if options.native_file:
+        properties['native_file'] = options.native_file
 
     config['options'] = options.cmd_line_options
     config['properties'] = properties
@@ -626,17 +618,25 @@ def update_cmd_line_file(build_dir, options):
     with open(filename, 'w') as f:
         config.write(f)
 
+def major_versions_differ(v1, v2):
+    return v1.split('.')[0:2] != v2.split('.')[0:2]
+
 def load(build_dir):
     filename = os.path.join(build_dir, 'meson-private', 'coredata.dat')
     load_fail_msg = 'Coredata file {!r} is corrupted. Try with a fresh build tree.'.format(filename)
     try:
         with open(filename, 'rb') as f:
             obj = pickle.load(f)
-    except pickle.UnpicklingError:
+    except (pickle.UnpicklingError, EOFError):
         raise MesonException(load_fail_msg)
+    except AttributeError:
+        raise MesonException(
+            "Coredata file {!r} references functions or classes that don't "
+            "exist. This probably means that it was generated with an old "
+            "version of meson.".format(filename))
     if not isinstance(obj, CoreData):
         raise MesonException(load_fail_msg)
-    if obj.version != version:
+    if major_versions_differ(obj.version, version):
         raise MesonException('Build directory has been generated with Meson version %s, '
                              'which is incompatible with current version %s.\n' %
                              (obj.version, version))
@@ -646,7 +646,7 @@ def save(obj, build_dir):
     filename = os.path.join(build_dir, 'meson-private', 'coredata.dat')
     prev_filename = filename + '.prev'
     tempfilename = filename + '~'
-    if obj.version != version:
+    if major_versions_differ(obj.version, version):
         raise MesonException('Fatal version mismatch corruption.')
     if os.path.exists(filename):
         import shutil
@@ -658,80 +658,10 @@ def save(obj, build_dir):
     os.replace(tempfilename, filename)
     return filename
 
-def get_builtin_options():
-    return list(builtin_options.keys())
-
-def is_builtin_option(optname):
-    return optname in get_builtin_options()
-
-def get_builtin_option_choices(optname):
-    if is_builtin_option(optname):
-        if builtin_options[optname][0] == UserComboOption:
-            return builtin_options[optname][2]
-        elif builtin_options[optname][0] == UserBooleanOption:
-            return [True, False]
-        elif builtin_options[optname][0] == UserFeatureOption:
-            return UserFeatureOption.static_choices
-        else:
-            return None
-    else:
-        raise RuntimeError('Tried to get the supported values for an unknown builtin option \'%s\'.' % optname)
-
-def get_builtin_option_description(optname):
-    if is_builtin_option(optname):
-        return builtin_options[optname][1]
-    else:
-        raise RuntimeError('Tried to get the description for an unknown builtin option \'%s\'.' % optname)
-
-def get_builtin_option_action(optname):
-    default = builtin_options[optname][2]
-    if default is True:
-        return 'store_false'
-    elif default is False:
-        return 'store_true'
-    return None
-
-def get_builtin_option_default(optname, prefix=''):
-    if is_builtin_option(optname):
-        o = builtin_options[optname]
-        if o[0] == UserComboOption:
-            return o[3]
-        if o[0] == UserIntegerOption:
-            return o[4]
-        try:
-            return builtin_dir_noprefix_options[optname][prefix]
-        except KeyError:
-            pass
-        return o[2]
-    else:
-        raise RuntimeError('Tried to get the default value for an unknown builtin option \'%s\'.' % optname)
-
-def get_builtin_option_cmdline_name(name):
-    if name == 'warning_level':
-        return '--warnlevel'
-    else:
-        return '--' + name.replace('_', '-')
-
-def add_builtin_argument(p, name):
-    kwargs = {}
-    c = get_builtin_option_choices(name)
-    b = get_builtin_option_action(name)
-    h = get_builtin_option_description(name)
-    if not b:
-        h = h.rstrip('.') + ' (default: %s).' % get_builtin_option_default(name)
-    else:
-        kwargs['action'] = b
-    if c and not b:
-        kwargs['choices'] = c
-    kwargs['default'] = argparse.SUPPRESS
-    kwargs['dest'] = name
-
-    cmdline_name = get_builtin_option_cmdline_name(name)
-    p.add_argument(cmdline_name, help=h, **kwargs)
 
 def register_builtin_arguments(parser):
-    for n in builtin_options:
-        add_builtin_argument(parser, n)
+    for n, b in builtin_options.items():
+        b.add_to_argparse(n, parser)
     parser.add_argument('-D', action='append', dest='projectoptions', default=[], metavar="option",
                         help='Set the value of an option, can be used several times to set multiple options.')
 
@@ -749,49 +679,132 @@ def parse_cmd_line_options(args):
     args.cmd_line_options = create_options_dict(args.projectoptions)
 
     # Merge builtin options set with --option into the dict.
-    for name in builtin_options:
-        value = getattr(args, name, None)
-        if value is not None:
-            if name in args.cmd_line_options:
-                cmdline_name = get_builtin_option_cmdline_name(name)
-                raise MesonException(
-                    'Got argument {0} as both -D{0} and {1}. Pick one.'.format(name, cmdline_name))
-            args.cmd_line_options[name] = value
-            delattr(args, name)
+    for name, builtin in builtin_options.items():
+        names = [name]
+        if builtin.separate_cross:
+            names.append('cross_' + name)
+        for name in names:
+            value = getattr(args, name, None)
+            if value is not None:
+                if name in args.cmd_line_options:
+                    cmdline_name = BuiltinOption.argparse_name_to_arg(name)
+                    raise MesonException(
+                        'Got argument {0} as both -D{0} and {1}. Pick one.'.format(name, cmdline_name))
+                args.cmd_line_options[name] = value
+                delattr(args, name)
 
-builtin_options = {
-    'buildtype':  [UserComboOption, 'Build type to use', ['plain', 'debug', 'debugoptimized', 'release', 'minsize', 'custom'], 'debug'],
-    'strip':      [UserBooleanOption, 'Strip targets on install', False],
-    'unity':      [UserComboOption, 'Unity build', ['on', 'off', 'subprojects'], 'off'],
-    'prefix':     [UserStringOption, 'Installation prefix', default_prefix()],
-    'libdir':     [UserStringOption, 'Library directory', default_libdir()],
-    'libexecdir': [UserStringOption, 'Library executable directory', default_libexecdir()],
-    'bindir':     [UserStringOption, 'Executable directory', 'bin'],
-    'sbindir':    [UserStringOption, 'System executable directory', 'sbin'],
-    'includedir': [UserStringOption, 'Header file directory', 'include'],
-    'datadir':    [UserStringOption, 'Data file directory', 'share'],
-    'mandir':     [UserStringOption, 'Manual page directory', 'share/man'],
-    'infodir':    [UserStringOption, 'Info page directory', 'share/info'],
-    'localedir':  [UserStringOption, 'Locale data directory', 'share/locale'],
-    'sysconfdir':      [UserStringOption, 'Sysconf data directory', 'etc'],
-    'localstatedir':   [UserStringOption, 'Localstate data directory', 'var'],
-    'sharedstatedir':  [UserStringOption, 'Architecture-independent data directory', 'com'],
-    'werror':          [UserBooleanOption, 'Treat warnings as errors', False],
-    'warning_level':   [UserComboOption, 'Compiler warning level to use', ['1', '2', '3'], '1'],
-    'layout':          [UserComboOption, 'Build directory layout', ['mirror', 'flat'], 'mirror'],
-    'default_library': [UserComboOption, 'Default library type', ['shared', 'static', 'both'], 'shared'],
-    'backend':         [UserComboOption, 'Backend to use', backendlist, 'ninja'],
-    'stdsplit':        [UserBooleanOption, 'Split stdout and stderr in test logs', True],
-    'errorlogs':       [UserBooleanOption, "Whether to print the logs from failing tests", True],
-    'install_umask':   [UserUmaskOption, 'Default umask to apply on permissions of installed files', '022'],
-    'auto_features':   [UserFeatureOption, "Override value of all 'auto' features", 'auto'],
-    'optimization':    [UserComboOption, 'Optimization level', ['0', 'g', '1', '2', '3', 's'], '0'],
-    'debug':           [UserBooleanOption, 'Debug', True],
-    'wrap_mode':       [UserComboOption, 'Wrap mode', ['default',
-                                                       'nofallback',
-                                                       'nodownload',
-                                                       'forcefallback'], 'default'],
-}
+
+_U = TypeVar('_U', bound=UserOption)
+
+class BuiltinOption(Generic[_U]):
+
+    """Class for a builtin option type.
+
+    Currently doesn't support UserIntegerOption, or a few other cases.
+    """
+
+    def __init__(self, opt_type: Type[_U], description: str, default: Any, yielding: Optional[bool] = None, *,
+                 choices: Any = None, separate_cross: bool = False):
+        self.opt_type = opt_type
+        self.description = description
+        self.default = default
+        self.choices = choices
+        self.yielding = yielding
+        self.separate_cross = separate_cross
+
+    def init_option(self, name: str) -> _U:
+        """Create an instance of opt_type and return it."""
+        keywords = {'yielding': self.yielding, 'value': self.default}
+        if self.choices:
+            keywords['choices'] = self.choices
+        return self.opt_type(name, self.description, **keywords)
+
+    def _argparse_action(self) -> Optional[str]:
+        if self.default is True:
+            return 'store_false'
+        elif self.default is False:
+            return 'store_true'
+        return None
+
+    def _argparse_choices(self) -> Any:
+        if self.opt_type is UserBooleanOption:
+            return [True, False]
+        elif self.opt_type is UserFeatureOption:
+            return UserFeatureOption.static_choices
+        return self.choices
+
+    @staticmethod
+    def argparse_name_to_arg(name: str) -> str:
+        if name == 'warning_level':
+            return '--warnlevel'
+        else:
+            return '--' + name.replace('_', '-')
+
+    def prefixed_default(self, name: str, prefix: str = '') -> Any:
+        if self.opt_type in [UserComboOption, UserIntegerOption]:
+            return self.default
+        try:
+            return builtin_dir_noprefix_options[name][prefix]
+        except KeyError:
+            pass
+        return self.default
+
+    def add_to_argparse(self, name: str, parser: argparse.ArgumentParser) -> None:
+        kwargs = {}
+
+        c = self._argparse_choices()
+        b = self._argparse_action()
+        h = self.description
+        if not b:
+            h = '{} (default: {}).'.format(h.rstrip('.'), self.prefixed_default(name))
+        else:
+            kwargs['action'] = b
+        if c and not b:
+            kwargs['choices'] = c
+        kwargs['default'] = argparse.SUPPRESS
+        kwargs['dest'] = name
+
+        cmdline_name = self.argparse_name_to_arg(name)
+        parser.add_argument(cmdline_name, help=h, **kwargs)
+        if self.separate_cross:
+            kwargs['dest'] = 'cross_' + name
+            parser.add_argument(self.argparse_name_to_arg('cross_' + name), help=h + ' (for host in cross compiles)', **kwargs)
+
+# Update `docs/markdown/Builtin-options.md` after changing the options below
+builtin_options = OrderedDict([
+    # Directories
+    ('prefix',     BuiltinOption(UserStringOption, 'Installation prefix', default_prefix())),
+    ('bindir',     BuiltinOption(UserStringOption, 'Executable directory', 'bin')),
+    ('datadir',    BuiltinOption(UserStringOption, 'Data file directory', 'share')),
+    ('includedir', BuiltinOption(UserStringOption, 'Header file directory', 'include')),
+    ('infodir',    BuiltinOption(UserStringOption, 'Info page directory', 'share/info')),
+    ('libdir',     BuiltinOption(UserStringOption, 'Library directory', default_libdir())),
+    ('libexecdir', BuiltinOption(UserStringOption, 'Library executable directory', default_libexecdir())),
+    ('localedir',  BuiltinOption(UserStringOption, 'Locale data directory', 'share/locale')),
+    ('localstatedir',   BuiltinOption(UserStringOption, 'Localstate data directory', 'var')),
+    ('mandir',          BuiltinOption(UserStringOption, 'Manual page directory', 'share/man')),
+    ('sbindir',         BuiltinOption(UserStringOption, 'System executable directory', 'sbin')),
+    ('sharedstatedir',  BuiltinOption(UserStringOption, 'Architecture-independent data directory', 'com')),
+    ('sysconfdir',      BuiltinOption(UserStringOption, 'Sysconf data directory', 'etc')),
+    # Core options
+    ('auto_features',   BuiltinOption(UserFeatureOption, "Override value of all 'auto' features", 'auto')),
+    ('backend',         BuiltinOption(UserComboOption, 'Backend to use', 'ninja', choices=backendlist)),
+    ('buildtype',       BuiltinOption(UserComboOption, 'Build type to use', 'debug',
+                                      choices=['plain', 'debug', 'debugoptimized', 'release', 'minsize', 'custom'])),
+    ('debug',           BuiltinOption(UserBooleanOption, 'Debug', True)),
+    ('default_library', BuiltinOption(UserComboOption, 'Default library type', 'shared', choices=['shared', 'static', 'both'])),
+    ('errorlogs',       BuiltinOption(UserBooleanOption, "Whether to print the logs from failing tests", True)),
+    ('install_umask',   BuiltinOption(UserUmaskOption, 'Default umask to apply on permissions of installed files', '022')),
+    ('layout',          BuiltinOption(UserComboOption, 'Build directory layout', 'mirror', choices=['mirror', 'flat'])),
+    ('pkg_config_path', BuiltinOption(UserArrayOption, 'List of additional paths for pkg-config to search', [], separate_cross=True)),
+    ('optimization',    BuiltinOption(UserComboOption, 'Optimization level', '0', choices=['0', 'g', '1', '2', '3', 's'])),
+    ('stdsplit',        BuiltinOption(UserBooleanOption, 'Split stdout and stderr in test logs', True)),
+    ('strip',           BuiltinOption(UserBooleanOption, 'Strip targets on install', False)),
+    ('unity',           BuiltinOption(UserComboOption, 'Unity build', 'off', choices=['on', 'off', 'subprojects'])),
+    ('warning_level',   BuiltinOption(UserComboOption, 'Compiler warning level to use', '1', choices=['0', '1', '2', '3'])),
+    ('werror',          BuiltinOption(UserBooleanOption, 'Treat warnings as errors', False)),
+    ('wrap_mode',       BuiltinOption(UserComboOption, 'Wrap mode', 'default', choices=['default', 'nofallback', 'nodownload', 'forcefallback'])),
+])
 
 # Special prefix-dependent defaults for installation directories that reside in
 # a path outside of the prefix in FHS and common usage.

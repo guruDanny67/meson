@@ -27,6 +27,7 @@ import tempfile
 from pathlib import Path, PurePath
 from mesonbuild import build
 from mesonbuild import environment
+from mesonbuild import compilers
 from mesonbuild import mesonlib
 from mesonbuild import mlog
 from mesonbuild import mtest
@@ -345,6 +346,12 @@ def _run_test(testdir, test_build_dir, install_dir, extra_args, compiler, backen
     if pass_libdir_to_test(testdir):
         gen_args += ['--libdir', 'lib']
     gen_args += [testdir, test_build_dir] + flags + test_args + extra_args
+    nativefile = os.path.join(testdir, 'nativefile.ini')
+    if os.path.exists(nativefile):
+        gen_args.extend(['--native-file', nativefile])
+    crossfile = os.path.join(testdir, 'crossfile.ini')
+    if os.path.exists(crossfile):
+        gen_args.extend(['--cross-file', crossfile])
     (returncode, stdo, stde) = run_configure(gen_args)
     try:
         logfile = Path(test_build_dir, 'meson-logs', 'meson-log.txt')
@@ -434,6 +441,14 @@ def have_d_compiler():
     elif shutil.which("gdc"):
         return True
     elif shutil.which("dmd"):
+        # The Windows installer sometimes produces a DMD install
+        # that exists but segfaults every time the compiler is run.
+        # Don't know why. Don't know how to fix. Skip in this case.
+        cp = subprocess.run(['dmd', '--version'],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+        if cp.stdout == b'':
+            return False
         return True
     return False
 
@@ -446,6 +461,7 @@ def have_objc_compiler():
             return False
         if not objc_comp:
             return False
+        env.coredata.process_new_compilers('objc', objc_comp, None, env)
         try:
             objc_comp.sanity_check(env.get_scratch_dir(), env)
         except mesonlib.MesonException:
@@ -461,6 +477,7 @@ def have_objcpp_compiler():
             return False
         if not objcpp_comp:
             return False
+        env.coredata.process_new_compilers('objcpp', objcpp_comp, None, env)
         try:
             objcpp_comp.sanity_check(env.get_scratch_dir(), env)
         except mesonlib.MesonException:
@@ -484,6 +501,10 @@ def skippable(suite, test):
     if test.endswith('10 gtk-doc'):
         return True
 
+    # NetCDF is not in the CI image
+    if test.endswith('netcdf'):
+        return True
+
     # No frameworks test should be skipped on linux CI, as we expect all
     # prerequisites to be installed
     if mesonlib.is_linux():
@@ -494,6 +515,10 @@ def skippable(suite, test):
     if test.endswith('1 boost'):
         if mesonlib.is_windows():
             return 'BOOST_ROOT' not in os.environ
+        return False
+
+    # Qt is provided on macOS by Homebrew
+    if test.endswith('4 qt') and mesonlib.is_osx():
         return False
 
     # Other framework tests are allowed to be skipped on other platforms
@@ -525,9 +550,11 @@ def detect_tests_to_run():
     # Name, subdirectory, skip condition.
     all_tests = [
         ('common', 'common', False),
+        ('warning-meson', 'warning', False),
         ('failing-meson', 'failing', False),
         ('failing-build', 'failing build', False),
         ('failing-test',  'failing test', False),
+        ('kconfig', 'kconfig', False),
 
         ('platform-osx', 'osx', not mesonlib.is_osx()),
         ('platform-windows', 'windows', not mesonlib.is_windows() and not mesonlib.is_cygwin()),
@@ -538,10 +565,11 @@ def detect_tests_to_run():
         ('vala', 'vala', backend is not Backend.ninja or not shutil.which('valac')),
         ('rust', 'rust', backend is not Backend.ninja or not shutil.which('rustc')),
         ('d', 'd', backend is not Backend.ninja or not have_d_compiler()),
-        ('objective c', 'objc', backend not in (Backend.ninja, Backend.xcode) or mesonlib.is_windows() or not have_objc_compiler()),
-        ('objective c++', 'objcpp', backend not in (Backend.ninja, Backend.xcode) or mesonlib.is_windows() or not have_objcpp_compiler()),
+        ('objective c', 'objc', backend not in (Backend.ninja, Backend.xcode) or not have_objc_compiler()),
+        ('objective c++', 'objcpp', backend not in (Backend.ninja, Backend.xcode) or not have_objcpp_compiler()),
         ('fortran', 'fortran', backend is not Backend.ninja or not shutil.which('gfortran')),
         ('swift', 'swift', backend not in (Backend.ninja, Backend.xcode) or not shutil.which('swiftc')),
+        ('cuda', 'cuda', backend not in (Backend.ninja, Backend.xcode) or not shutil.which('nvcc')),
         ('python3', 'python3', backend is not Backend.ninja),
         ('python', 'python', backend is not Backend.ninja),
         ('fpga', 'fpga', shutil.which('yosys') is None),
@@ -600,9 +628,14 @@ def _run_tests(all_tests, log_name_base, failfast, extra_args):
             (testnum, testbase) = t.name.split(' ', 1)
             testname = '%.3d %s' % (int(testnum), testbase)
             should_fail = False
+            suite_args = []
             if name.startswith('failing'):
                 should_fail = name.split('failing-')[1]
-            result = executor.submit(run_test, skipped, t.as_posix(), extra_args, system_compiler, backend, backend_flags, commands, should_fail)
+            if name.startswith('warning'):
+                suite_args = ['--fatal-meson-warnings']
+                should_fail = name.split('warning-')[1]
+            result = executor.submit(run_test, skipped, t.as_posix(), extra_args + suite_args,
+                                     system_compiler, backend, backend_flags, commands, should_fail)
             futures.append((testname, t, result))
         for (testname, t, result) in futures:
             sys.stdout.flush()
@@ -736,11 +769,23 @@ def detect_system_compiler():
 
     with AutoDeletedDir(tempfile.mkdtemp(prefix='b ', dir='.')) as build_dir:
         env = environment.Environment(None, build_dir, get_fake_options('/'))
-        try:
-            comp = env.detect_c_compiler(env.is_cross_build())
-        except:
-            raise RuntimeError("Could not find C compiler.")
-        system_compiler = comp.get_id()
+        print()
+        for lang in sorted(compilers.all_languages):
+            try:
+                comp = env.compiler_from_language(lang, env.is_cross_build())
+                details = '%s %s' % (' '.join(comp.get_exelist()), comp.get_version_string())
+            except:
+                comp = None
+                details = 'not found'
+            print('%-7s: %s' % (lang, details))
+
+            # note C compiler for later use by platform_fix_name()
+            if lang == 'c':
+                if comp:
+                    system_compiler = comp.get_id()
+                else:
+                    raise RuntimeError("Could not find C compiler.")
+        print()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the test suite of Meson.")

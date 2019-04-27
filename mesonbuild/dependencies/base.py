@@ -14,12 +14,11 @@
 
 # This file contains the detection logic for external dependencies.
 # Custom logic for several other packages are in separate files.
-
+from typing import Dict, Any
 import copy
 import functools
 import os
 import re
-import stat
 import json
 import shlex
 import shutil
@@ -27,14 +26,17 @@ import textwrap
 import platform
 import itertools
 import ctypes
+from typing import List, Tuple
 from enum import Enum
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 from .. import mlog
 from .. import mesonlib
 from ..compilers import clib_langs
-from ..mesonlib import MesonException, OrderedSet
+from ..environment import BinaryTable, Environment, MachineInfo
+from ..mesonlib import MachineChoice, MesonException, OrderedSet, PerMachine
 from ..mesonlib import Popen_safe, version_compare_many, version_compare, listify
+from ..mesonlib import Version, LibType
 
 # These must be defined in this file to avoid cyclical references.
 packages = {}
@@ -113,6 +115,7 @@ class Dependency:
         self.raw_link_args = None
         self.sources = []
         self.methods = self._process_method_kw(kwargs)
+        self.ext_deps = []  # type: List[Dependency]
 
     def __repr__(self):
         s = '<{0} {1}: {2}>'
@@ -150,20 +153,15 @@ class Dependency:
     def get_exe_args(self, compiler):
         return []
 
-    def need_openmp(self):
-        return False
-
-    def need_threads(self):
-        return False
-
     def get_pkgconfig_variable(self, variable_name, kwargs):
         raise DependencyException('{!r} is not a pkgconfig dependency'.format(self.name))
 
     def get_configtool_variable(self, variable_name):
         raise DependencyException('{!r} is not a config-tool dependency'.format(self.name))
 
-    def get_partial_dependency(self, *, compile_args=False, link_args=False,
-                               links=False, includes=False, sources=False):
+    def get_partial_dependency(self, *, compile_args: bool = False,
+                               link_args: bool = False, links: bool = False,
+                               includes: bool = False, sources: bool = False):
         """Create a new dependency that contains part of the parent dependency.
 
         The following options can be inherited:
@@ -201,20 +199,22 @@ class InternalDependency(Dependency):
         raise DependencyException('Method "get_configtool_variable()" is '
                                   'invalid for an internal dependency')
 
-    def get_partial_dependency(self, *, compile_args=False, link_args=False,
-                               links=False, includes=False, sources=False):
-        compile_args = self.compile_args.copy() if compile_args else []
-        link_args = self.link_args.copy() if link_args else []
-        libraries = self.libraries.copy() if links else []
-        whole_libraries = self.whole_libraries.copy() if links else []
-        sources = self.sources.copy() if sources else []
-        includes = self.include_directories.copy() if includes else []
-        deps = [d.get_partial_dependency(
+    def get_partial_dependency(self, *, compile_args: bool = False,
+                               link_args: bool = False, links: bool = False,
+                               includes: bool = False, sources: bool = False):
+        final_compile_args = self.compile_args.copy() if compile_args else []
+        final_link_args = self.link_args.copy() if link_args else []
+        final_libraries = self.libraries.copy() if links else []
+        final_whole_libraries = self.whole_libraries.copy() if links else []
+        final_sources = self.sources.copy() if sources else []
+        final_includes = self.include_directories.copy() if includes else []
+        final_deps = [d.get_partial_dependency(
             compile_args=compile_args, link_args=link_args, links=links,
             includes=includes, sources=sources) for d in self.ext_deps]
         return InternalDependency(
-            self.version, includes, compile_args, link_args, libraries,
-            whole_libraries, sources, deps)
+            self.version, final_includes, final_compile_args,
+            final_link_args, final_libraries, final_whole_libraries,
+            final_sources, final_deps)
 
 
 class ExternalDependency(Dependency):
@@ -263,13 +263,18 @@ class ExternalDependency(Dependency):
     def get_compiler(self):
         return self.clib_compiler
 
-    def get_partial_dependency(self, *, compile_args=False, link_args=False,
-                               links=False, includes=False, sources=False):
+    def get_partial_dependency(self, *, compile_args: bool = False,
+                               link_args: bool = False, links: bool = False,
+                               includes: bool = False, sources: bool = False):
         new = copy.copy(self)
         if not compile_args:
             new.compile_args = []
         if not link_args:
             new.link_args = []
+        if not sources:
+            new.sources = []
+        if not includes:
+            new.include_directories = []
         if not sources:
             new.sources = []
 
@@ -326,6 +331,11 @@ class NotFoundDependency(Dependency):
         self.env = environment
         self.name = 'not-found'
         self.is_found = False
+
+    def get_partial_dependency(self, *, compile_args: bool = False,
+                               link_args: bool = False, links: bool = False,
+                               includes: bool = False, sources: bool = False):
+        return copy.copy(self)
 
 
 class ConfigToolDependency(ExternalDependency):
@@ -393,24 +403,30 @@ class ConfigToolDependency(ExternalDependency):
         if not isinstance(versions, list) and versions is not None:
             versions = listify(versions)
 
-        if self.env.is_cross_build() and not self.native:
-            cross_file = self.env.cross_info.config['binaries']
-            try:
-                tools = [cross_file[self.tool_name]]
-            except KeyError:
-                mlog.warning('No entry for {0} specified in your cross file. '
-                             'Falling back to searching PATH. This may find a '
-                             'native version of {0}!'.format(self.tool_name))
-                tools = self.tools
-        elif self.tool_name in self.env.config_info.binaries:
-            tools = [self.env.config_info.binaries[self.tool_name]]
+        for_machine = MachineChoice.BUILD if self.native else MachineChoice.HOST
+        tool = self.env.binaries[for_machine].lookup_entry(self.tool_name)
+        if tool is not None:
+            tools = [tool]
         else:
-            tools = self.tools
+            if self.env.is_cross_build() and not self.native:
+                mlog.deprecation('No entry for {0} specified in your cross file. '
+                                 'Falling back to searching PATH. This may find a '
+                                 'native version of {0}! This will become a hard '
+                                 'error in a future version of meson'.format(self.tool_name))
+            tools = [[t] for t in self.tools]
 
         best_match = (None, None)
         for tool in tools:
+            if len(tool) == 1:
+                # In some situations the command can't be directly executed.
+                # For example Shell scripts need to be called through sh on
+                # Windows (see issue #1423).
+                potential_bin = ExternalProgram(tool[0], silent=True)
+                if not potential_bin.found():
+                    continue
+                tool = potential_bin.get_command()
             try:
-                p, out = Popen_safe([tool, '--version'])[:2]
+                p, out = Popen_safe(tool + ['--version'])[:2]
             except (FileNotFoundError, PermissionError):
                 continue
             if p.returncode != 0:
@@ -439,20 +455,24 @@ class ConfigToolDependency(ExternalDependency):
 
     def report_config(self, version, req_version):
         """Helper method to print messages about the tool."""
+
+        found_msg = [mlog.bold(self.tool_name), 'found:']
+
         if self.config is None:
-            if version is not None:
-                mlog.log('Found', mlog.bold(self.tool_name), repr(version),
-                         mlog.red('NO'), '(needed', req_version, ')')
-            else:
-                mlog.log('Found', mlog.bold(self.tool_name), repr(req_version),
-                         mlog.red('NO'))
-            return False
-        mlog.log('Found {}:'.format(self.tool_name), mlog.bold(shutil.which(self.config)),
-                 '({})'.format(version))
-        return True
+            found_msg.append(mlog.red('NO'))
+            if version is not None and req_version is not None:
+                found_msg.append('found {!r} but need {!r}'.format(version, req_version))
+            elif req_version:
+                found_msg.append('need {!r}'.format(req_version))
+        else:
+            found_msg += [mlog.green('YES'), '({})'.format(' '.join(self.config)), version]
+
+        mlog.log(*found_msg)
+
+        return self.config is not None
 
     def get_config_value(self, args, stage):
-        p, out, err = Popen_safe([self.config] + args)
+        p, out, err = Popen_safe(self.config + args)
         # This is required to keep shlex from stripping path separators on
         # Windows. Also, don't put escape sequences in config values, okay?
         out = out.replace('\\', '\\\\')
@@ -469,7 +489,7 @@ class ConfigToolDependency(ExternalDependency):
         return [DependencyMethods.AUTO, DependencyMethods.CONFIG_TOOL]
 
     def get_configtool_variable(self, variable_name):
-        p, out, _ = Popen_safe([self.config, '--{}'.format(variable_name)])
+        p, out, _ = Popen_safe(self.config + ['--{}'.format(variable_name)])
         if p.returncode != 0:
             if self.required:
                 raise DependencyException(
@@ -486,7 +506,7 @@ class ConfigToolDependency(ExternalDependency):
 class PkgConfigDependency(ExternalDependency):
     # The class's copy of the pkg-config path. Avoids having to search for it
     # multiple times in the same Meson invocation.
-    class_pkgbin = None
+    class_pkgbin = PerMachine(None, None, None)
     # We cache all pkg-config subprocess invocations to avoid redundant calls
     pkgbin_cache = {}
 
@@ -498,31 +518,66 @@ class PkgConfigDependency(ExternalDependency):
         # stored in the pickled coredata and recovered.
         self.pkgbin = None
 
-        # When finding dependencies for cross-compiling, we don't care about
-        # the 'native' pkg-config
-        if self.want_cross:
-            if 'pkgconfig' not in environment.cross_info.config['binaries']:
-                if self.required:
-                    raise DependencyException('Pkg-config binary missing from cross file')
-            else:
-                potential_pkgbin = ExternalProgram.from_bin_list(
-                    environment.cross_info.config['binaries'], 'pkgconfig')
-                if potential_pkgbin.found():
-                    self.pkgbin = potential_pkgbin
-                else:
-                    mlog.debug('Cross pkg-config %s not found.' % potential_pkgbin.name)
-        # Only search for the native pkg-config the first time and
-        # store the result in the class definition
-        elif PkgConfigDependency.class_pkgbin is None:
-            self.pkgbin = self.check_pkgconfig()
-            PkgConfigDependency.class_pkgbin = self.pkgbin
+        if not self.want_cross and environment.is_cross_build():
+            for_machine = MachineChoice.BUILD
         else:
-            self.pkgbin = PkgConfigDependency.class_pkgbin
+            for_machine = MachineChoice.HOST
 
-        if not self.pkgbin:
+        # Create an iterator of options
+        def search():
+            # Lookup in cross or machine file.
+            potential_pkgpath = environment.binaries[for_machine].lookup_entry('pkgconfig')
+            if potential_pkgpath is not None:
+                mlog.debug('Pkg-config binary for {} specified from cross file, native file, '
+                           'or env var as {}'.format(for_machine, potential_pkgpath))
+                yield ExternalProgram.from_entry('pkgconfig', potential_pkgpath)
+                # We never fallback if the user-specified option is no good, so
+                # stop returning options.
+                return
+            mlog.debug('Pkg-config binary missing from cross or native file, or env var undefined.')
+            # Fallback on hard-coded defaults.
+            # TODO prefix this for the cross case instead of ignoring thing.
+            if environment.machines.matches_build_machine(for_machine):
+                for potential_pkgpath in environment.default_pkgconfig:
+                    mlog.debug('Trying a default pkg-config fallback at', potential_pkgpath)
+                    yield ExternalProgram(potential_pkgpath, silent=True)
+
+        # Only search for pkg-config for each machine the first time and store
+        # the result in the class definition
+        if PkgConfigDependency.class_pkgbin[for_machine] is False:
+            mlog.debug('Pkg-config binary for %s is cached as not found.' % for_machine)
+        elif PkgConfigDependency.class_pkgbin[for_machine] is not None:
+            mlog.debug('Pkg-config binary for %s is cached.' % for_machine)
+        else:
+            assert PkgConfigDependency.class_pkgbin[for_machine] is None
+            mlog.debug('Pkg-config binary for %s is not cached.' % for_machine)
+            for potential_pkgbin in search():
+                mlog.debug('Trying pkg-config binary {} for machine {} at {}'
+                           .format(potential_pkgbin.name, for_machine, potential_pkgbin.command))
+                version_if_ok = self.check_pkgconfig(potential_pkgbin)
+                if not version_if_ok:
+                    continue
+                if not self.silent:
+                    mlog.log('Found pkg-config:', mlog.bold(potential_pkgbin.get_path()),
+                             '(%s)' % version_if_ok)
+                PkgConfigDependency.class_pkgbin[for_machine] = potential_pkgbin
+                break
+            else:
+                if not self.silent:
+                    mlog.log('Found Pkg-config:', mlog.red('NO'))
+                # Set to False instead of None to signify that we've already
+                # searched for it and not found it
+                PkgConfigDependency.class_pkgbin[for_machine] = False
+
+        self.pkgbin = PkgConfigDependency.class_pkgbin[for_machine]
+        if self.pkgbin is False:
+            self.pkgbin = None
+            msg = 'Pkg-config binary for machine %s not found. Giving up.' % for_machine
             if self.required:
-                raise DependencyException('Pkg-config not found.')
-            return
+                raise DependencyException(msg)
+            else:
+                mlog.debug(msg)
+                return
 
         mlog.debug('Determining dependency {!r} with pkg-config executable '
                    '{!r}'.format(name, self.pkgbin.get_path()))
@@ -560,11 +615,19 @@ class PkgConfigDependency(ExternalDependency):
         return rc, out
 
     def _call_pkgbin(self, args, env=None):
+        # Always copy the environment since we're going to modify it
+        # with pkg-config variables
         if env is None:
-            fenv = env
-            env = os.environ
+            env = os.environ.copy()
         else:
-            fenv = frozenset(env.items())
+            env = env.copy()
+
+        if self.want_cross:
+            extra_paths = self.env.coredata.get_builtin_option('cross_pkg_config_path')
+        else:
+            extra_paths = self.env.coredata.get_builtin_option('pkg_config_path')
+        env['PKG_CONFIG_PATH'] = ':'.join([p for p in extra_paths])
+        fenv = frozenset(env.items())
         targs = tuple(args)
         cache = PkgConfigDependency.pkgbin_cache
         if (self.pkgbin, targs, fenv) not in cache:
@@ -642,7 +705,11 @@ class PkgConfigDependency(ExternalDependency):
         raw_link_args = self._convert_mingw_paths(shlex.split(out_raw))
         for arg in raw_link_args:
             if arg.startswith('-L') and not arg.startswith(('-L-l', '-L-L')):
-                prefix_libpaths.add(arg[2:])
+                path = arg[2:]
+                if not os.path.isabs(path):
+                    # Resolve the path as a compiler in the build directory would
+                    path = os.path.join(self.env.get_build_dir(), path)
+                prefix_libpaths.add(path)
         system_libpaths = OrderedSet()
         full_args = self._convert_mingw_paths(shlex.split(out))
         for arg in full_args:
@@ -657,7 +724,7 @@ class PkgConfigDependency(ExternalDependency):
         libs_found = OrderedSet()
         # Track not-found libraries to know whether to add library paths
         libs_notfound = []
-        libtype = 'static' if self.static else 'default'
+        libtype = LibType.STATIC if self.static else LibType.PREFER_SHARED
         # Generate link arguments for this library
         link_args = []
         for lib in full_args:
@@ -752,10 +819,10 @@ class PkgConfigDependency(ExternalDependency):
         if 'define_variable' in kwargs:
             definition = kwargs.get('define_variable', [])
             if not isinstance(definition, list):
-                raise MesonException('define_variable takes a list')
+                raise DependencyException('define_variable takes a list')
 
             if len(definition) != 2 or not all(isinstance(i, str) for i in definition):
-                raise MesonException('define_variable must be made up of 2 strings for VARIABLENAME and VARIABLEVALUE')
+                raise DependencyException('define_variable must be made up of 2 strings for VARIABLENAME and VARIABLEVALUE')
 
             options = ['--define-variable=' + '='.join(definition)] + options
 
@@ -785,33 +852,27 @@ class PkgConfigDependency(ExternalDependency):
     def get_methods():
         return [DependencyMethods.PKGCONFIG]
 
-    def check_pkgconfig(self):
-        evar = 'PKG_CONFIG'
-        if evar in os.environ:
-            pkgbin = os.environ[evar].strip()
-        else:
-            pkgbin = 'pkg-config'
-        pkgbin = ExternalProgram(pkgbin, silent=True)
-        if pkgbin.found():
-            try:
-                p, out = Popen_safe(pkgbin.get_command() + ['--version'])[0:2]
-                if p.returncode != 0:
-                    mlog.warning('Found pkg-config {!r} but couldn\'t run it'
-                                 ''.format(' '.join(pkgbin.get_command())))
-                    # Set to False instead of None to signify that we've already
-                    # searched for it and not found it
-                    pkgbin = False
-            except (FileNotFoundError, PermissionError):
-                pkgbin = False
-        else:
-            pkgbin = False
-        if not self.silent:
-            if pkgbin:
-                mlog.log('Found pkg-config:', mlog.bold(pkgbin.get_path()),
-                         '(%s)' % out.strip())
-            else:
-                mlog.log('Found Pkg-config:', mlog.red('NO'))
-        return pkgbin
+    def check_pkgconfig(self, pkgbin):
+        if not pkgbin.found():
+            mlog.log('Did not find pkg-config by name {!r}'.format(pkgbin.name))
+            return None
+        try:
+            p, out = Popen_safe(pkgbin.get_command() + ['--version'])[0:2]
+            if p.returncode != 0:
+                mlog.warning('Found pkg-config {!r} but it failed when run'
+                             ''.format(' '.join(pkgbin.get_command())))
+                return None
+        except FileNotFoundError:
+            mlog.warning('We thought we found pkg-config {!r} but now it\'s not there. How odd!'
+                         ''.format(' '.join(pkgbin.get_command())))
+            return None
+        except PermissionError:
+            msg = 'Found pkg-config {!r} but didn\'t have permissions to run it.'.format(' '.join(pkgbin.get_command()))
+            if not mesonlib.is_windows():
+                msg += '\n\nOn Unix-like systems this is often caused by scripts that are not executable.'
+            mlog.warning(msg)
+            return None
+        return out.strip()
 
     def extract_field(self, la_file, fieldname):
         with open(la_file) as f:
@@ -878,19 +939,21 @@ class CMakeTarget:
 class CMakeDependency(ExternalDependency):
     # The class's copy of the CMake path. Avoids having to search for it
     # multiple times in the same Meson invocation.
-    class_cmakebin = None
-    class_cmakevers = None
+    class_cmakebin = PerMachine(None, None, None)
+    class_cmakevers = PerMachine(None, None, None)
+    class_cmakeinfo = PerMachine(None, None, None)
     # We cache all pkg-config subprocess invocations to avoid redundant calls
     cmake_cache = {}
     # Version string for the minimum CMake version
     class_cmake_version = '>=3.4'
     # CMake generators to try (empty for no generator)
     class_cmake_generators = ['', 'Ninja', 'Unix Makefiles', 'Visual Studio 10 2010']
+    class_working_generator = None
 
     def _gen_exception(self, msg):
         return DependencyException('Dependency {} not found: {}'.format(self.name, msg))
 
-    def __init__(self, name, environment, kwargs, language=None):
+    def __init__(self, name: str, environment: Environment, kwargs, language=None):
         super().__init__('cmake', environment, language, kwargs)
         self.name = name
         self.is_libtool = False
@@ -898,6 +961,7 @@ class CMakeDependency(ExternalDependency):
         # stored in the pickled coredata and recovered.
         self.cmakebin = None
         self.cmakevers = None
+        self.cmakeinfo = None
 
         # Dict of CMake variables: '<var_name>': ['list', 'of', 'values']
         self.vars = {}
@@ -911,43 +975,256 @@ class CMakeDependency(ExternalDependency):
         # When finding dependencies for cross-compiling, we don't care about
         # the 'native' CMake binary
         # TODO: Test if this works as expected
-        if self.want_cross:
-            if 'cmake' not in environment.cross_info.config['binaries']:
-                if self.required:
-                    raise self._gen_exception('CMake binary missing from cross file')
-            else:
-                potential_cmake = ExternalProgram.from_cross_info(environment.cross_info, 'cmake')
-                if potential_cmake.found():
-                    self.cmakebin = potential_cmake
-                    CMakeDependency.class_cmakebin = self.cmakebin
-                else:
-                    mlog.debug('Cross CMake %s not found.' % potential_cmake.name)
-        # Only search for the native CMake the first time and
-        # store the result in the class definition
-        elif CMakeDependency.class_cmakebin is None:
-            self.cmakebin, self.cmakevers = self.check_cmake()
-            CMakeDependency.class_cmakebin = self.cmakebin
-            CMakeDependency.class_cmakevers = self.cmakevers
+        if environment.is_cross_build() and not self.want_cross:
+            for_machine = MachineChoice.BUILD
         else:
-            self.cmakebin = CMakeDependency.class_cmakebin
-            self.cmakevers = CMakeDependency.class_cmakevers
+            for_machine = MachineChoice.HOST
 
-        if not self.cmakebin:
+        # Create an iterator of options
+        def search():
+            # Lookup in cross or machine file.
+            potential_cmakepath = environment.binaries[for_machine].lookup_entry('cmake')
+            if potential_cmakepath is not None:
+                mlog.debug('CMake binary for %s specified from cross file, native file, or env var as %s.', for_machine, potential_cmakepath)
+                yield ExternalProgram.from_entry('cmake', potential_cmakepath)
+                # We never fallback if the user-specified option is no good, so
+                # stop returning options.
+                return
+            mlog.debug('CMake binary missing from cross or native file, or env var undefined.')
+            # Fallback on hard-coded defaults.
+            # TODO prefix this for the cross case instead of ignoring thing.
+            if environment.machines.matches_build_machine(for_machine):
+                for potential_cmakepath in environment.default_cmake:
+                    mlog.debug('Trying a default CMake fallback at', potential_cmakepath)
+                    yield ExternalProgram(potential_cmakepath, silent=True)
+
+        # Only search for CMake the first time and store the result in the class
+        # definition
+        if CMakeDependency.class_cmakebin[for_machine] is False:
+            mlog.debug('CMake binary for %s is cached as not found' % for_machine)
+        elif CMakeDependency.class_cmakebin[for_machine] is not None:
+            mlog.debug('CMake binary for %s is cached.' % for_machine)
+        else:
+            assert CMakeDependency.class_cmakebin[for_machine] is None
+            mlog.debug('CMake binary for %s is not cached' % for_machine)
+            for potential_cmakebin in search():
+                mlog.debug('Trying CMake binary {} for machine {} at {}'
+                           .format(potential_cmakebin.name, for_machine, potential_cmakebin.command))
+                version_if_ok = self.check_cmake(potential_cmakebin)
+                if not version_if_ok:
+                    continue
+                if not self.silent:
+                    mlog.log('Found CMake:', mlog.bold(potential_cmakebin.get_path()),
+                             '(%s)' % version_if_ok)
+                CMakeDependency.class_cmakebin[for_machine] = potential_cmakebin
+                CMakeDependency.class_cmakevers[for_machine] = version_if_ok
+                break
+            else:
+                if not self.silent:
+                    mlog.log('Found CMake:', mlog.red('NO'))
+                # Set to False instead of None to signify that we've already
+                # searched for it and not found it
+                CMakeDependency.class_cmakebin[for_machine] = False
+                CMakeDependency.class_cmakevers[for_machine] = None
+
+        self.cmakebin = CMakeDependency.class_cmakebin[for_machine]
+        self.cmakevers = CMakeDependency.class_cmakevers[for_machine]
+        if self.cmakebin is False:
+            self.cmakebin = None
+            msg = 'No CMake binary for machine %s not found. Giving up.' % for_machine
             if self.required:
-                raise self._gen_exception('CMake not found.')
+                raise DependencyException(msg)
+            mlog.debug(msg)
             return
 
+        if CMakeDependency.class_cmakeinfo[for_machine] is None:
+            CMakeDependency.class_cmakeinfo[for_machine] = self._get_cmake_info()
+        self.cmakeinfo = CMakeDependency.class_cmakeinfo[for_machine]
+        if self.cmakeinfo is None:
+            raise self._gen_exception('Unable to obtain CMake system information')
+
         modules = kwargs.get('modules', [])
+        cm_path = kwargs.get('cmake_module_path', [])
+        cm_args = kwargs.get('cmake_args', [])
         if not isinstance(modules, list):
             modules = [modules]
-        self._detect_dep(name, modules)
+        if not isinstance(cm_path, list):
+            cm_path = [cm_path]
+        if not isinstance(cm_args, list):
+            cm_args = [cm_args]
+        cm_path = [x if os.path.isabs(x) else os.path.join(environment.get_source_dir(), x) for x in cm_path]
+        if cm_path:
+            cm_args += ['-DCMAKE_MODULE_PATH={}'.format(';'.join(cm_path))]
+        if not self._preliminary_find_check(name, cm_path, environment.machines[for_machine]):
+            return
+        self._detect_dep(name, modules, cm_args)
 
     def __repr__(self):
         s = '<{0} {1}: {2} {3}>'
         return s.format(self.__class__.__name__, self.name, self.is_found,
                         self.version_reqs)
 
-    def _detect_dep(self, name, modules):
+    def _get_cmake_info(self):
+        mlog.debug("Extracting basic cmake information")
+        res = {}
+
+        # Try different CMake generators since specifying no generator may fail
+        # in cygwin for some reason
+        gen_list = []
+        # First try the last working generator
+        if CMakeDependency.class_working_generator is not None:
+            gen_list += [CMakeDependency.class_working_generator]
+        gen_list += CMakeDependency.class_cmake_generators
+
+        for i in gen_list:
+            mlog.debug('Try CMake generator: {}'.format(i if len(i) > 0 else 'auto'))
+
+            # Prepare options
+            cmake_opts = ['--trace-expand', '.']
+            if len(i) > 0:
+                cmake_opts = ['-G', i] + cmake_opts
+
+            # Run CMake
+            ret1, out1, err1 = self._call_cmake(cmake_opts, 'CMakePathInfo.txt')
+
+            # Current generator was successful
+            if ret1 == 0:
+                CMakeDependency.class_working_generator = i
+                break
+
+            mlog.debug('CMake failed to gather system information for generator {} with error code {}'.format(i, ret1))
+            mlog.debug('OUT:\n{}\n\n\nERR:\n{}\n\n'.format(out1, err1))
+
+        # Check if any generator succeeded
+        if ret1 != 0:
+            return None
+
+        try:
+            # First parse the trace
+            lexer1 = self._lex_trace(err1)
+
+            # Primary pass -- parse all invocations of set
+            for l in lexer1:
+                if l.func == 'set':
+                    self._cmake_set(l)
+        except:
+            return None
+
+        # Extract the variables and sanity check them
+        module_paths = sorted(set(self.get_cmake_var('MESON_PATHS_LIST')))
+        module_paths = list(filter(lambda x: os.path.isdir(x), module_paths))
+        archs = self.get_cmake_var('MESON_ARCH_LIST')
+
+        common_paths = ['lib', 'lib32', 'lib64', 'libx32', 'share']
+        for i in archs:
+            common_paths += [os.path.join('lib', i)]
+
+        res = {
+            'module_paths': module_paths,
+            'cmake_root': self.get_cmake_var('MESON_CMAKE_ROOT')[0],
+            'archs': archs,
+            'common_paths': common_paths
+        }
+
+        mlog.debug('  -- Module search paths:    {}'.format(res['module_paths']))
+        mlog.debug('  -- CMake root:             {}'.format(res['cmake_root']))
+        mlog.debug('  -- CMake architectures:    {}'.format(res['archs']))
+        mlog.debug('  -- CMake lib search paths: {}'.format(res['common_paths']))
+
+        # Reset variables
+        self.vars = {}
+        return res
+
+    @staticmethod
+    @functools.lru_cache(maxsize=None)
+    def _cached_listdir(path: str) -> Tuple[Tuple[str, str]]:
+        try:
+            return tuple((x, str(x).lower()) for x in os.listdir(path))
+        except OSError:
+            return ()
+
+    @staticmethod
+    @functools.lru_cache(maxsize=None)
+    def _cached_isdir(path: str) -> bool:
+        try:
+            return os.path.isdir(path)
+        except OSError:
+            return False
+
+    def _preliminary_find_check(self, name: str, module_path: List[str], machine: MachineInfo) -> bool:
+        lname = str(name).lower()
+
+        # Checks <path>, <path>/cmake, <path>/CMake
+        def find_module(path: str) -> bool:
+            for i in [path, os.path.join(path, 'cmake'), os.path.join(path, 'CMake')]:
+                if not self._cached_isdir(i):
+                    continue
+
+                for j in ['Find{}.cmake', '{}Config.cmake', '{}-config.cmake']:
+                    if os.path.isfile(os.path.join(i, j.format(name))):
+                        return True
+            return False
+
+        # Search in <path>/(lib/<arch>|lib*|share) for cmake files
+        def search_lib_dirs(path: str) -> bool:
+            for i in [os.path.join(path, x) for x in self.cmakeinfo['common_paths']]:
+                if not self._cached_isdir(i):
+                    continue
+
+                # Check <path>/(lib/<arch>|lib*|share)/cmake/<name>*/
+                cm_dir = os.path.join(i, 'cmake')
+                if self._cached_isdir(cm_dir):
+                    content = self._cached_listdir(cm_dir)
+                    content = list(filter(lambda x: x[1].startswith(lname), content))
+                    for k in content:
+                        if find_module(os.path.join(cm_dir, k[0])):
+                            return True
+
+                # <path>/(lib/<arch>|lib*|share)/<name>*/
+                # <path>/(lib/<arch>|lib*|share)/<name>*/(cmake|CMake)/
+                content = self._cached_listdir(i)
+                content = list(filter(lambda x: x[1].startswith(lname), content))
+                for k in content:
+                    if find_module(os.path.join(i, k[0])):
+                        return True
+
+            return False
+
+        # Check the user provided and system module paths
+        for i in module_path + [os.path.join(self.cmakeinfo['cmake_root'], 'Modules')]:
+            if find_module(i):
+                return True
+
+        # Check the system paths
+        for i in self.cmakeinfo['module_paths']:
+            if find_module(i):
+                return True
+
+            if search_lib_dirs(i):
+                return True
+
+            content = self._cached_listdir(i)
+            content = list(filter(lambda x: x[1].startswith(lname), content))
+            for k in content:
+                if search_lib_dirs(os.path.join(i, k[0])):
+                    return True
+
+            # Mac framework support
+            if machine.is_darwin():
+                for j in ['{}.framework', '{}.app']:
+                    j = j.format(lname)
+                    if j in content:
+                        if find_module(os.path.join(i, j[0], 'Resources')) or find_module(os.path.join(i, j[0], 'Version')):
+                            return True
+
+        # Check the environment path
+        env_path = os.environ.get('{}_DIR'.format(name))
+        if env_path and find_module(env_path):
+            return True
+
+        return False
+
+    def _detect_dep(self, name: str, modules: List[str], args: List[str]):
         # Detect a dependency with CMake using the '--find-package' mode
         # and the trace output (stderr)
         #
@@ -959,19 +1236,26 @@ class CMakeDependency(ExternalDependency):
 
         # Try different CMake generators since specifying no generator may fail
         # in cygwin for some reason
-        for i in CMakeDependency.class_cmake_generators:
+        gen_list = []
+        # First try the last working generator
+        if CMakeDependency.class_working_generator is not None:
+            gen_list += [CMakeDependency.class_working_generator]
+        gen_list += CMakeDependency.class_cmake_generators
+
+        for i in gen_list:
             mlog.debug('Try CMake generator: {}'.format(i if len(i) > 0 else 'auto'))
 
             # Prepare options
-            cmake_opts = ['--trace-expand', '-DNAME={}'.format(name), '.']
+            cmake_opts = ['--trace-expand', '-DNAME={}'.format(name), '-DARCHS={}'.format(';'.join(self.cmakeinfo['archs']))] + args + ['.']
             if len(i) > 0:
                 cmake_opts = ['-G', i] + cmake_opts
 
             # Run CMake
-            ret1, out1, err1 = self._call_cmake(cmake_opts)
+            ret1, out1, err1 = self._call_cmake(cmake_opts, 'CMakeLists.txt')
 
             # Current generator was successful
             if ret1 == 0:
+                CMakeDependency.class_working_generator = i
                 break
 
             mlog.debug('CMake failed for generator {} and package {} with error code {}'.format(i, name, ret1))
@@ -1140,7 +1424,7 @@ class CMakeDependency(ExternalDependency):
 
     def get_cmake_var(self, var):
         # Return the value of the CMake variable var or an empty list if var does not exist
-        for var in self.vars:
+        if var in self.vars:
             return self.vars[var]
 
         return []
@@ -1368,24 +1652,25 @@ set(CMAKE_CXX_ABI_COMPILED TRUE)
 set(CMAKE_SIZEOF_VOID_P "{}")
 '''.format(os.path.realpath(__file__), ctypes.sizeof(ctypes.c_voidp)))
 
-    def _setup_cmake_dir(self):
+    def _setup_cmake_dir(self, cmake_file: str) -> str:
         # Setup the CMake build environment and return the "build" directory
         build_dir = '{}/cmake_{}'.format(self.cmake_root_dir, self.name)
         os.makedirs(build_dir, exist_ok=True)
 
         # Copy the CMakeLists.txt
         cmake_lists = '{}/CMakeLists.txt'.format(build_dir)
-        if not os.path.exists(cmake_lists):
-            dir_path = os.path.dirname(os.path.realpath(__file__))
-            src_cmake = '{}/data/CMakeLists.txt'.format(dir_path)
-            shutil.copyfile(src_cmake, cmake_lists)
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        src_cmake = '{}/data/{}'.format(dir_path, cmake_file)
+        if os.path.exists(cmake_lists):
+            os.remove(cmake_lists)
+        shutil.copyfile(src_cmake, cmake_lists)
 
         self._setup_compiler(build_dir)
         self._reset_cmake_cache(build_dir)
         return build_dir
 
-    def _call_cmake_real(self, args, env):
-        build_dir = self._setup_cmake_dir()
+    def _call_cmake_real(self, args, cmake_file: str, env):
+        build_dir = self._setup_cmake_dir(cmake_file)
         cmd = self.cmakebin.get_command() + args
         p, out, err = Popen_safe(cmd, env=env, cwd=build_dir)
         rc = p.returncode
@@ -1394,7 +1679,7 @@ set(CMAKE_SIZEOF_VOID_P "{}")
 
         return rc, out, err
 
-    def _call_cmake(self, args, env=None):
+    def _call_cmake(self, args, cmake_file: str, env=None):
         if env is None:
             fenv = env
             env = os.environ
@@ -1404,56 +1689,42 @@ set(CMAKE_SIZEOF_VOID_P "{}")
 
         # First check if cached, if not call the real cmake function
         cache = CMakeDependency.cmake_cache
-        if (self.cmakebin, targs, fenv) not in cache:
-            cache[(self.cmakebin, targs, fenv)] = self._call_cmake_real(args, env)
-        return cache[(self.cmakebin, targs, fenv)]
+        if (self.cmakebin, targs, cmake_file, fenv) not in cache:
+            cache[(self.cmakebin, targs, cmake_file, fenv)] = self._call_cmake_real(args, cmake_file, env)
+        return cache[(self.cmakebin, targs, cmake_file, fenv)]
 
     @staticmethod
     def get_methods():
         return [DependencyMethods.CMAKE]
 
-    def check_cmake(self):
-        evar = 'CMAKE'
-        if evar in os.environ:
-            cmakebin = os.environ[evar].strip()
-        else:
-            cmakebin = 'cmake'
-        cmakebin = ExternalProgram(cmakebin, silent=True)
-        cmvers = None
-        invalid_version = False
-        if cmakebin.found():
-            try:
-                p, out = Popen_safe(cmakebin.get_command() + ['--version'])[0:2]
-                if p.returncode != 0:
-                    mlog.warning('Found CMake {!r} but couldn\'t run it'
-                                 ''.format(' '.join(cmakebin.get_command())))
-                    # Set to False instead of None to signify that we've already
-                    # searched for it and not found it
-                    cmakebin = False
-            except (FileNotFoundError, PermissionError):
-                cmakebin = False
-
-            cmvers = re.sub(r'\s*cmake version\s*', '', out.split('\n')[0]).strip()
-            if not version_compare(cmvers, CMakeDependency.class_cmake_version):
-                invalid_version = True
-        else:
-            cmakebin = False
-        if not self.silent:
-            if cmakebin and invalid_version:
-                mlog.log('Found CMake:', mlog.red('NO'), '(version of', mlog.bold(cmakebin.get_path()),
-                         'is', mlog.bold(cmvers), 'but version', mlog.bold(CMakeDependency.class_cmake_version),
-                         'is required)')
-            elif cmakebin:
-                mlog.log('Found CMake:', mlog.bold(cmakebin.get_path()),
-                         '(%s)' % cmvers)
-            else:
-                mlog.log('Found CMake:', mlog.red('NO'))
-
-        if invalid_version:
-            cmakebin = False
-            cmvers = None
-
-        return cmakebin, cmvers
+    def check_cmake(self, cmakebin):
+        if not cmakebin.found():
+            mlog.log('Did not find CMake {!r}'.format(cmakebin.name))
+            return None
+        try:
+            p, out = Popen_safe(cmakebin.get_command() + ['--version'])[0:2]
+            if p.returncode != 0:
+                mlog.warning('Found CMake {!r} but couldn\'t run it'
+                             ''.format(' '.join(cmakebin.get_command())))
+                return None
+        except FileNotFoundError:
+            mlog.warning('We thought we found CMake {!r} but now it\'s not there. How odd!'
+                         ''.format(' '.join(cmakebin.get_command())))
+            return None
+        except PermissionError:
+            msg = 'Found CMake {!r} but didn\'t have permissions to run it.'.format(' '.join(cmakebin.get_command()))
+            if not mesonlib.is_windows():
+                msg += '\n\nOn Unix-like systems this is often caused by scripts that are not executable.'
+            mlog.warning(msg)
+            return None
+        cmvers = re.sub(r'\s*cmake version\s*', '', out.split('\n')[0]).strip()
+        if not version_compare(cmvers, CMakeDependency.class_cmake_version):
+            mlog.warning(
+                'The version of CMake', mlog.bold(cmakebin.get_path()),
+                'is', mlog.bold(cmvers), 'but version', mlog.bold(CMakeDependency.class_cmake_version),
+                'is required')
+            return None
+        return cmvers
 
     def log_tried(self):
         return self.type_name
@@ -1607,9 +1878,9 @@ class DubDependency(ExternalDependency):
             return ''
 
         # Ex.: library-debug-linux.posix-x86_64-ldc_2081-EF934983A3319F8F8FF2F0E107A363BA
-        build_name = 'library-{}-{}-{}-{}_{}'.format(description['buildType'], '.'.join(description['platform']), '.'.join(description['architecture']), comp, d_ver)
+        build_name = '-{}-{}-{}-{}_{}'.format(description['buildType'], '.'.join(description['platform']), '.'.join(description['architecture']), comp, d_ver)
         for entry in os.listdir(module_build_path):
-            if entry.startswith(build_name):
+            if build_name in entry:
                 for file in os.listdir(os.path.join(module_build_path, entry)):
                     if file == lib_file_name:
                         if folder_only:
@@ -1688,14 +1959,15 @@ class ExternalProgram:
         '''Human friendly description of the command'''
         return ' '.join(self.command)
 
-    @staticmethod
-    def from_bin_list(bins, name):
-        if name not in bins:
+    @classmethod
+    def from_bin_list(cls, bt: BinaryTable, name):
+        command = bt.lookup_entry(name)
+        if command is None:
             return NonExistingExternalProgram()
-        command = bins[name]
-        if not isinstance(command, (list, str)):
-            raise MesonException('Invalid type {!r} for binary {!r} in cross file'
-                                 ''.format(command, name))
+        return cls.from_entry(name, command)
+
+    @staticmethod
+    def from_entry(name, command):
         if isinstance(command, list):
             if len(command) == 1:
                 command = command[0]
@@ -1703,6 +1975,7 @@ class ExternalProgram:
         # need to search if the path is an absolute path.
         if isinstance(command, list) or os.path.isabs(command):
             return ExternalProgram(name, command=command, silent=True)
+        assert isinstance(command, str)
         # Search for the command using the specified string!
         return ExternalProgram(command, silent=True)
 
@@ -1740,6 +2013,12 @@ class ExternalProgram:
                         commands = commands[1:]
                     # We know what python3 is, we're running on it
                     if len(commands) > 0 and commands[0] == 'python3':
+                        commands = mesonlib.python_command + commands[1:]
+                else:
+                    # Replace python3 with the actual python3 that we are using
+                    if commands[0] == '/usr/bin/env' and commands[1] == 'python3':
+                        commands = mesonlib.python_command + commands[2:]
+                    elif commands[0].split('/')[-1] == 'python3':
                         commands = mesonlib.python_command + commands[1:]
                 return commands + [script]
         except Exception as e:
@@ -1913,8 +2192,9 @@ class ExternalLibrary(ExternalDependency):
             return []
         return super().get_link_args(**kwargs)
 
-    def get_partial_dependency(self, *, compile_args=False, link_args=False,
-                               links=False, includes=False, sources=False):
+    def get_partial_dependency(self, *, compile_args: bool = False,
+                               link_args: bool = False, links: bool = False,
+                               includes: bool = False, sources: bool = False):
         # External library only has link_args, so ignore the rest of the
         # interface.
         new = copy.copy(self)
@@ -1924,57 +2204,113 @@ class ExternalLibrary(ExternalDependency):
 
 
 class ExtraFrameworkDependency(ExternalDependency):
-    def __init__(self, name, required, path, env, lang, kwargs):
+    system_framework_paths = None
+
+    def __init__(self, name, required, paths, env, lang, kwargs):
         super().__init__('extraframeworks', env, lang, kwargs)
         self.name = name
         self.required = required
-        self.detect(name, path)
-        if self.found():
-            self.compile_args = ['-I' + os.path.join(self.path, self.name, 'Headers')]
-            self.link_args = ['-F' + self.path, '-framework', self.name.split('.')[0]]
+        # Full path to framework directory
+        self.framework_path = None
+        if not self.clib_compiler:
+            raise DependencyException('No C-like compilers are available')
+        if self.system_framework_paths is None:
+            try:
+                self.system_framework_paths = self.clib_compiler.find_framework_paths(self.env)
+            except MesonException as e:
+                if 'non-clang' in str(e):
+                    # Apple frameworks can only be found (and used) with the
+                    # system compiler. It is not available so bail immediately.
+                    self.is_found = False
+                    return
+                raise
+        self.detect(name, paths)
 
-    def detect(self, name, path):
-        # should use the compiler to look for frameworks, rather than peering at
-        # the filesystem, so we can also find them when cross-compiling
-        if self.want_cross:
+    def detect(self, name, paths):
+        if not paths:
+            paths = self.system_framework_paths
+        for p in paths:
+            mlog.debug('Looking for framework {} in {}'.format(name, p))
+            # We need to know the exact framework path because it's used by the
+            # Qt5 dependency class, and for setting the include path. We also
+            # want to avoid searching in an invalid framework path which wastes
+            # time and can cause a false positive.
+            framework_path = self._get_framework_path(p, name)
+            if framework_path is None:
+                continue
+            # We want to prefer the specified paths (in order) over the system
+            # paths since these are "extra" frameworks.
+            # For example, Python2's framework is in /System/Library/Frameworks and
+            # Python3's framework is in /Library/Frameworks, but both are called
+            # Python.framework. We need to know for sure that the framework was
+            # found in the path we expect.
+            allow_system = p in self.system_framework_paths
+            args = self.clib_compiler.find_framework(name, self.env, [p], allow_system)
+            if args is None:
+                continue
+            self.link_args = args
+            self.framework_path = framework_path.as_posix()
+            self.compile_args = ['-F' + self.framework_path]
+            # We need to also add -I includes to the framework because all
+            # cross-platform projects such as OpenGL, Python, Qt, GStreamer,
+            # etc do not use "framework includes":
+            # https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPFrameworks/Tasks/IncludingFrameworks.html
+            incdir = self._get_framework_include_path(framework_path)
+            if incdir:
+                self.compile_args += ['-I' + incdir]
+            self.is_found = True
             return
 
+    def _get_framework_path(self, path, name):
+        p = Path(path)
         lname = name.lower()
-        if path is None:
-            paths = ['/System/Library/Frameworks', '/Library/Frameworks']
-        else:
-            paths = [path]
-        for p in paths:
-            for d in os.listdir(p):
-                fullpath = os.path.join(p, d)
-                if lname != d.rsplit('.', 1)[0].lower():
-                    continue
-                if not stat.S_ISDIR(os.stat(fullpath).st_mode):
-                    continue
-                self.path = p
-                self.name = d
-                self.is_found = True
-                return
+        for d in p.glob('*.framework/'):
+            if lname == d.name.rsplit('.', 1)[0].lower():
+                return d
+        return None
+
+    def _get_framework_latest_version(self, path):
+        versions = []
+        for each in path.glob('Versions/*'):
+            # macOS filesystems are usually case-insensitive
+            if each.name.lower() == 'current':
+                continue
+            versions.append(Version(each.name))
+        return 'Versions/{}/Headers'.format(sorted(versions)[-1]._s)
+
+    def _get_framework_include_path(self, path):
+        # According to the spec, 'Headers' must always be a symlink to the
+        # Headers directory inside the currently-selected version of the
+        # framework, but sometimes frameworks are broken. Look in 'Versions'
+        # for the currently-selected version or pick the latest one.
+        trials = ('Headers', 'Versions/Current/Headers',
+                  self._get_framework_latest_version(path))
+        for each in trials:
+            trial = path / each
+            if trial.is_dir():
+                return trial.as_posix()
+        return None
+
+    @staticmethod
+    def get_methods():
+        return [DependencyMethods.EXTRAFRAMEWORK]
 
     def log_info(self):
-        return os.path.join(self.path, self.name)
+        return self.framework_path
 
     def log_tried(self):
         return 'framework'
 
 
 def get_dep_identifier(name, kwargs, want_cross):
-    # Need immutable objects since the identifier will be used as a dict key
-    version_reqs = listify(kwargs.get('version', []))
-    if isinstance(version_reqs, list):
-        version_reqs = frozenset(version_reqs)
-    identifier = (name, version_reqs, want_cross)
+    identifier = (name, want_cross)
     for key, value in kwargs.items():
-        # 'version' is embedded above as the second element for easy access
+        # 'version' is irrelevant for caching; the caller must check version matches
         # 'native' is handled above with `want_cross`
         # 'required' is irrelevant for caching; the caller handles it separately
         # 'fallback' subprojects cannot be cached -- they must be initialized
-        if key in ('version', 'native', 'required', 'fallback',):
+        # 'default_options' is only used in fallback case
+        if key in ('version', 'native', 'required', 'fallback', 'default_options'):
             continue
         # All keyword arguments are strings, ints, or lists (or lists of lists)
         if isinstance(value, list):
@@ -1987,8 +2323,10 @@ display_name_map = {
     'dub': 'DUB',
     'gmock': 'GMock',
     'gtest': 'GTest',
+    'hdf5': 'HDF5',
     'llvm': 'LLVM',
     'mpi': 'MPI',
+    'netcdf': 'NetCDF',
     'openmp': 'OpenMP',
     'wxwidgets': 'WxWidgets',
 }
@@ -2029,7 +2367,7 @@ def find_external_dependency(name, env, kwargs):
             d = c()
             d._check_version()
             pkgdep.append(d)
-        except Exception as e:
+        except DependencyException as e:
             pkg_exc.append(e)
             mlog.debug(str(e))
         else:
@@ -2071,7 +2409,7 @@ def find_external_dependency(name, env, kwargs):
         # if an exception occurred with the first detection method, re-raise it
         # (on the grounds that it came from the preferred dependency detection
         # method)
-        if pkg_exc[0]:
+        if pkg_exc and pkg_exc[0]:
             raise pkg_exc[0]
 
         # we have a list of failed ExternalDependency objects, so we can report
@@ -2079,15 +2417,10 @@ def find_external_dependency(name, env, kwargs):
         raise DependencyException('Dependency "%s" not found' % (name) +
                                   (', tried %s' % (tried) if tried else ''))
 
-    # return the last failed dependency object
-    if pkgdep:
-        return pkgdep[-1]
-
-    # this should never happen
-    raise DependencyException('Dependency "%s" not found, but no dependency object to return' % (name))
+    return NotFoundDependency(env)
 
 
-def _build_external_dependency_list(name, env, kwargs):
+def _build_external_dependency_list(name, env: Environment, kwargs: Dict[str, Any]) -> list:
     # First check if the method is valid
     if 'method' in kwargs and kwargs['method'] not in [e.value for e in DependencyMethods]:
         raise DependencyException('method {!r} is invalid'.format(kwargs['method']))
@@ -2119,6 +2452,14 @@ def _build_external_dependency_list(name, env, kwargs):
     # If it's explicitly requested, use the CMake detection method (only)
     if 'cmake' == kwargs.get('method', ''):
         candidates.append(functools.partial(CMakeDependency, name, env, kwargs))
+        return candidates
+
+    # If it's explicitly requested, use the Extraframework detection method (only)
+    if 'extraframework' == kwargs.get('method', ''):
+        # On OSX, also try framework dependency detector
+        if mesonlib.is_osx():
+            candidates.append(functools.partial(ExtraFrameworkDependency, name,
+                                                False, None, env, None, kwargs))
         return candidates
 
     # Otherwise, just use the pkgconfig and cmake dependency detector

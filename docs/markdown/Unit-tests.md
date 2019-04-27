@@ -30,7 +30,7 @@ Note how you need to specify multiple values as an array.
 Coverage
 --
 
-If you enable coverage measurements by giving Meson the command line flag `-Db_coverage=true`, you can generate coverage reports. Meson will autodetect what coverage generator tools you have installed and will generate the corresponding targets. These targets are `coverage-xml` and `coverage-text` which are both provided by [Gcovr](http://gcovr.com) and `coverage-html`, which requires [Lcov](https://ltp.sourceforge.io/coverage/lcov.php) and [GenHTML](https://linux.die.net/man/1/genhtml) or [Gcovr](http://gcovr.com) with html support.
+If you enable coverage measurements by giving Meson the command line flag `-Db_coverage=true`, you can generate coverage reports. Meson will autodetect what coverage generator tools you have installed and will generate the corresponding targets. These targets are `coverage-xml` and `coverage-text` which are both provided by [Gcovr](http://gcovr.com) (version 3.3 or higher) and `coverage-html`, which requires [Lcov](https://ltp.sourceforge.io/coverage/lcov.php) and [GenHTML](https://linux.die.net/man/1/genhtml) or [Gcovr](http://gcovr.com). As a convenience, a high-level `coverage` target is also generated which will produce all 3 coverage report types, if possible.
 
 The output of these commands is written to the log directory `meson-logs` in your build directory.
 
@@ -51,9 +51,15 @@ By default Meson uses as many concurrent processes as there are cores on the tes
 $ MESON_TESTTHREADS=5 ninja test
 ```
 
-## Skipped tests
+## Skipped tests and hard errors
 
-Sometimes a test can only determine at runtime that it can not be run. The GNU standard approach in this case is to exit the program with error code 77. Meson will detect this and report these tests as skipped rather than failed. This behavior was added in version 0.37.0.
+Sometimes a test can only determine at runtime that it can not be run.
+
+For the default `exitcode` testing protocol, the GNU standard approach in this case is to exit the program with error code 77. Meson will detect this and report these tests as skipped rather than failed. This behavior was added in version 0.37.0.
+
+For TAP-based tests, skipped tests should print a single line starting with `1..0 # SKIP`.
+
+In addition, sometimes a test fails set up so that it should fail even if it is marked as an expected failure. The GNU standard approach in this case is to exit the program with error code 99. Again, Meson will detect this and report these tests as `ERROR`, ignoring the setting of `should_fail`. This behavior was added in version 0.50.0.
 
 ## Testing tool
 

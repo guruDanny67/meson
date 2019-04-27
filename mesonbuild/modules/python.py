@@ -23,11 +23,10 @@ from . import ExtensionModule
 from mesonbuild.modules import ModuleReturnValue
 from ..interpreterbase import (
     noPosargs, noKwargs, permittedKwargs,
-    InterpreterObject, InvalidArguments,
+    InvalidArguments,
     FeatureNew, FeatureNewKwargs, disablerIfNotFound
 )
 from ..interpreter import ExternalProgramHolder, extract_required_kwarg
-from ..interpreterbase import flatten
 from ..build import known_shmod_kwargs
 from .. import mlog
 from ..environment import detect_cpu_family
@@ -43,9 +42,8 @@ mod_kwargs -= set(['name_prefix', 'name_suffix'])
 
 
 def run_command(python, command):
-    _, stdout, _ = mesonlib.Popen_safe(python.get_command() + [
-        '-c',
-        command])
+    cmd = python.get_command() + ['-c', command]
+    _, stdout, _ = mesonlib.Popen_safe(cmd)
 
     return stdout.strip()
 
@@ -61,6 +59,7 @@ class PythonDependency(ExternalDependency):
         self.pkgdep = None
         self.variables = python_holder.variables
         self.paths = python_holder.paths
+        self.link_libpython = python_holder.link_libpython
         if mesonlib.version_compare(self.version, '>= 3.0'):
             self.major_version = 3
         else:
@@ -131,7 +130,7 @@ class PythonDependency(ExternalDependency):
         if self.is_found:
             mlog.log('Dependency', mlog.bold(self.name), 'found:', mlog.green('YES ({})'.format(py_lookup_method)))
         else:
-            mlog.log('Dependency', mlog.bold(self.name), 'found:', mlog.red('NO'))
+            mlog.log('Dependency', mlog.bold(self.name), 'found:', [mlog.red('NO')])
 
     def _find_libpy(self, python_holder, environment):
         if python_holder.is_pypy:
@@ -150,10 +149,10 @@ class PythonDependency(ExternalDependency):
             libdirs = []
 
         largs = self.clib_compiler.find_library(libname, environment, libdirs)
-
-        self.is_found = largs is not None
-        if self.is_found:
+        if largs is not None:
             self.link_args = largs
+
+        self.is_found = largs is not None or not self.link_libpython
 
         inc_paths = mesonlib.OrderedSet([
             self.variables.get('INCLUDEPY'),
@@ -184,10 +183,14 @@ class PythonDependency(ExternalDependency):
         if self.platform.startswith('win'):
             vernum = self.variables.get('py_version_nodot')
             if self.static:
-                libname = 'libpython{}.a'.format(vernum)
+                libpath = Path('libs') / 'libpython{}.a'.format(vernum)
             else:
-                libname = 'python{}.lib'.format(vernum)
-            lib = Path(self.variables.get('base')) / 'libs' / libname
+                comp = self.get_compiler()
+                if comp.id == "gcc":
+                    libpath = 'python{}.dll'.format(vernum)
+                else:
+                    libpath = Path('libs') / 'python{}.lib'.format(vernum)
+            lib = Path(self.variables.get('base')) / libpath
         elif self.platform == 'mingw':
             if self.static:
                 libname = self.variables.get('LIBRARY')
@@ -261,8 +264,7 @@ class PythonDependency(ExternalDependency):
             return super().get_pkgconfig_variable(variable_name, kwargs)
 
 
-INTROSPECT_COMMAND = '''
-import sysconfig
+INTROSPECT_COMMAND = '''import sysconfig
 import json
 import sys
 
@@ -494,40 +496,40 @@ class PythonModule(ExtensionModule):
     def find_installation(self, interpreter, state, args, kwargs):
         feature_check = FeatureNew('Passing "feature" option to find_installation', '0.48.0')
         disabled, required, feature = extract_required_kwarg(kwargs, state.subproject, feature_check)
-        if disabled:
-            mlog.log('find_installation skipped: feature', mlog.bold(feature), 'disabled')
-            return ExternalProgramHolder(NonExistingExternalProgram())
 
         if len(args) > 1:
             raise InvalidArguments('find_installation takes zero or one positional argument.')
 
-        if 'python' in state.environment.config_info.binaries:
-            name_or_path = state.environment.config_info.binaries['python']
-        elif args:
+        name_or_path = state.environment.binaries.host.lookup_entry('python')
+        if name_or_path is None and args:
             name_or_path = args[0]
             if not isinstance(name_or_path, str):
                 raise InvalidArguments('find_installation argument must be a string.')
-        else:
-            name_or_path = None
+
+        if disabled:
+            mlog.log('Program', name_or_path or 'python', 'found:', mlog.red('NO'), '(disabled by:', mlog.bold(feature), ')')
+            return ExternalProgramHolder(NonExistingExternalProgram())
 
         if not name_or_path:
-            mlog.log("Using meson's python {}".format(mesonlib.python_command))
-            python = ExternalProgram('python3', mesonlib.python_command, silent=True)
+            python = ExternalProgram('python3', mesonlib.python_command)
         else:
-            python = ExternalProgram(name_or_path, silent = True)
+            python = ExternalProgram.from_entry('python3', name_or_path)
 
             if not python.found() and mesonlib.is_windows():
                 pythonpath = self._get_win_pythonpath(name_or_path)
                 if pythonpath is not None:
                     name_or_path = pythonpath
-                    python = ExternalProgram(name_or_path, silent = True)
+                    python = ExternalProgram(name_or_path, silent=True)
 
             # Last ditch effort, python2 or python3 can be named python
             # on various platforms, let's not give up just yet, if an executable
             # named python is available and has a compatible version, let's use
             # it
             if not python.found() and name_or_path in ['python2', 'python3']:
-                python = ExternalProgram('python', silent = True)
+                python = ExternalProgram('python', silent=True)
+
+            mlog.log('Program', python.name, 'found:',
+                     *[mlog.green('YES'), '({})'.format(' '.join(python.command))] if python.found() else [mlog.red('NO')])
 
         if not python.found():
             if required:

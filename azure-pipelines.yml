@@ -50,6 +50,34 @@ jobs:
           backend: ninja
 
   steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.5'
+      addToPath: true
+      architecture: 'x64'
+  - template: ci/azure-steps.yml
+
+- job: vs2019
+  pool:
+    vmImage: windows-2019
+
+  strategy:
+    matrix:
+        vc2019x64ninja:
+          arch: x64
+          compiler: msvc2019
+          backend: ninja
+        vc2019x64vs:
+          arch: x64
+          compiler: msvc2019
+          backend: vs2019
+
+  steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.7'
+      addToPath: true
+      architecture: 'x64'
   - template: ci/azure-steps.yml
 
 - job: cygwin
@@ -68,6 +96,7 @@ jobs:
     - script: |
         %CYGWIN_ROOT%\cygwinsetup.exe -qnNdO -R "%CYGWIN_ROOT%" -s "%CYGWIN_MIRROR%" -g -P ^
         cmake,^
+        gcc-fortran,^
         gcc-objc++,^
         gcc-objc,^
         git,^
@@ -76,12 +105,14 @@ jobs:
         libglib2.0-devel,^
         libgtk3-devel,^
         ninja,^
-        python3-pip,^
+        python35-pip,^
         vala,^
         zlib-devel
       displayName: Install Dependencies
     - script: |
+        set BOOST_ROOT=
         set PATH=%CYGWIN_ROOT%\bin;%SYSTEMROOT%\system32
+        cp /usr/bin/python3.5 /usr/bin/python3
         env.exe -- python3 run_tests.py --backend=ninja
       displayName: Run Tests
     - task: CopyFiles@2
@@ -136,6 +167,7 @@ jobs:
         git ^
         mercurial ^
         mingw-w64-$(MSYS2_ARCH)-cmake ^
+        mingw-w64-$(MSYS2_ARCH)-ninja ^
         mingw-w64-$(MSYS2_ARCH)-pkg-config ^
         mingw-w64-$(MSYS2_ARCH)-python2 ^
         mingw-w64-$(MSYS2_ARCH)-python3 ^
@@ -143,10 +175,10 @@ jobs:
         %TOOLCHAIN%
       displayName: Install Dependencies
     - script: |
+        set BOOST_ROOT=
         set PATH=%SystemRoot%\system32;%SystemRoot%;%SystemRoot%\System32\Wbem
-        %MSYS2_ROOT%\usr\bin\bash -lc "wget https://github.com/mesonbuild/cidata/raw/master/ninja.exe; mv ninja.exe /$MSYSTEM/bin"
         set PATHEXT=%PATHEXT%;.py
-        if %compiler%==clang ( set CC=clang && set CXX=clang++ )
+        if %compiler%==clang ( set CC=clang && set CXX=clang++ && set OBJC=clang && set OBJCXX=clang++ )
         %MSYS2_ROOT%\usr\bin\bash -lc "MSYSTEM= python3 run_tests.py --backend=ninja"
       env:
         CHERE_INVOKING: yes

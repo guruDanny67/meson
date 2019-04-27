@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from . import (coredata, mesonlib, build)
+from . import coredata, environment, mesonlib, build, mintro, mlog
 
 def add_arguments(parser):
     coredata.register_builtin_arguments(parser)
@@ -22,17 +22,44 @@ def add_arguments(parser):
                         help='Clear cached state (e.g. found dependencies)')
 
 
+def make_lower_case(val):
+    if isinstance(val, bool):
+        return str(val).lower()
+    elif isinstance(val, list):
+        return [make_lower_case(i) for i in val]
+    else:
+        return str(val)
+
+
 class ConfException(mesonlib.MesonException):
     pass
 
 
 class Conf:
     def __init__(self, build_dir):
-        self.build_dir = build_dir
-        if not os.path.isdir(os.path.join(build_dir, 'meson-private')):
-            raise ConfException('Directory %s does not seem to be a Meson build directory.' % build_dir)
-        self.build = build.load(self.build_dir)
-        self.coredata = coredata.load(self.build_dir)
+        self.build_dir = os.path.abspath(os.path.realpath(build_dir))
+        if 'meson.build' in [os.path.basename(self.build_dir), self.build_dir]:
+            self.build_dir = os.path.dirname(self.build_dir)
+        self.build = None
+        self.max_choices_line_length = 60
+
+        if os.path.isdir(os.path.join(self.build_dir, 'meson-private')):
+            self.build = build.load(self.build_dir)
+            self.source_dir = self.build.environment.get_source_dir()
+            self.coredata = coredata.load(self.build_dir)
+            self.default_values_only = False
+        elif os.path.isfile(os.path.join(self.build_dir, environment.build_filename)):
+            # Make sure that log entries in other parts of meson don't interfere with the JSON output
+            mlog.disable()
+            self.source_dir = os.path.abspath(os.path.realpath(self.build_dir))
+            intr = mintro.IntrospectionInterpreter(self.source_dir, '', 'ninja')
+            intr.analyze()
+            # Reenable logging just in case
+            mlog.enable()
+            self.coredata = intr.coredata
+            self.default_values_only = True
+        else:
+            raise ConfException('Directory {} is neither a Meson build directory nor a project source directory.'.format(build_dir))
 
     def clear_cache(self):
         self.coredata.deps = {}
@@ -41,26 +68,22 @@ class Conf:
         self.coredata.set_options(options)
 
     def save(self):
+        # Do nothing when using introspection
+        if self.default_values_only:
+            return
         # Only called if something has changed so overwrite unconditionally.
         coredata.save(self.coredata, self.build_dir)
         # We don't write the build file because any changes to it
         # are erased when Meson is executed the next time, i.e. when
         # Ninja is run.
 
-    @staticmethod
-    def print_aligned(arr):
-        def make_lower_case(val):
-            if isinstance(val, bool):
-                return str(val).lower()
-            elif isinstance(val, list):
-                return [make_lower_case(i) for i in val]
-            else:
-                return str(val)
-
+    def print_aligned(self, arr):
         if not arr:
             return
 
         titles = {'name': 'Option', 'descr': 'Description', 'value': 'Current Value', 'choices': 'Possible Values'}
+        if self.default_values_only:
+            titles['value'] = 'Default Value'
 
         name_col = [titles['name'], '-' * len(titles['name'])]
         value_col = [titles['value'], '-' * len(titles['value'])]
@@ -78,7 +101,20 @@ class Conf:
             if opt['choices']:
                 choices_found = True
                 if isinstance(opt['choices'], list):
-                    choices_col.append('[{0}]'.format(', '.join(make_lower_case(opt['choices']))))
+                    choices_list = make_lower_case(opt['choices'])
+                    current = '['
+                    while choices_list:
+                        i = choices_list.pop(0)
+                        if len(current) + len(i) >= self.max_choices_line_length:
+                            choices_col.append(current + ',')
+                            name_col.append('')
+                            value_col.append('')
+                            descr_col.append('')
+                            current = ' '
+                        if len(current) > 1:
+                            current += ', '
+                        current += i
+                    choices_col.append(current + ']')
                 else:
                     choices_col.append(make_lower_case(opt['choices']))
             else:
@@ -100,20 +136,26 @@ class Conf:
         if not options:
             print('  No {}\n'.format(title.lower()))
         arr = []
-        for k in sorted(options):
-            o = options[k]
+        for k, o in sorted(options.items()):
             d = o.description
-            v = o.value
+            v = o.printable_value()
             c = o.choices
-            if isinstance(o, coredata.UserUmaskOption):
-                v = format(v, '04o')
             arr.append({'name': k, 'descr': d, 'value': v, 'choices': c})
         self.print_aligned(arr)
 
     def print_conf(self):
+        def print_default_values_warning():
+            mlog.warning('The source directory instead of the build directory was specified.')
+            mlog.warning('Only the default values for the project are printed, and all command line parameters are ignored.')
+
+        if self.default_values_only:
+            print_default_values_warning()
+            print('')
+
         print('Core properties:')
-        print('  Source dir', self.build.environment.source_dir)
-        print('  Build dir ', self.build.environment.build_dir)
+        print('  Source dir', self.source_dir)
+        if not self.default_values_only:
+            print('  Build dir ', self.build_dir)
 
         dir_option_names = ['bindir',
                             'datadir',
@@ -139,20 +181,33 @@ class Conf:
         self.print_options('Core options', core_options)
         self.print_options('Backend options', self.coredata.backend_options)
         self.print_options('Base options', self.coredata.base_options)
-        self.print_options('Compiler options', self.coredata.compiler_options)
+        # TODO others
+        self.print_options('Compiler options', self.coredata.compiler_options.build)
         self.print_options('Directories', dir_options)
         self.print_options('Project options', self.coredata.user_options)
         self.print_options('Testing options', test_options)
 
+        # Print the warning twice so that the user shouldn't be able to miss it
+        if self.default_values_only:
+            print('')
+            print_default_values_warning()
 
 def run(options):
     coredata.parse_cmd_line_options(options)
     builddir = os.path.abspath(os.path.realpath(options.builddir))
+    c = None
     try:
         c = Conf(builddir)
+        if c.default_values_only:
+            c.print_conf()
+            return 0
+
         save = False
         if len(options.cmd_line_options) > 0:
             c.set_options(options.cmd_line_options)
+            if not c.build.environment.is_cross_build():
+                # TODO think about cross and command-line interface.
+                c.coredata.compiler_options.host = c.coredata.compiler_options.build
             coredata.update_cmd_line_file(builddir, options)
             save = True
         elif options.clearcache:
@@ -162,7 +217,11 @@ def run(options):
             c.print_conf()
         if save:
             c.save()
+            mintro.update_build_options(c.coredata, c.build.environment.info_dir)
+            mintro.write_meson_info_file(c.build, [])
     except ConfException as e:
         print('Meson configurator encountered an error:')
+        if c is not None and c.build is not None:
+            mintro.write_meson_info_file(c.build, [e])
         raise e
     return 0

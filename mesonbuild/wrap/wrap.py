@@ -218,17 +218,16 @@ class Resolver:
 
     def get_git(self):
         revno = self.wrap.get('revision')
-        if self.wrap.values.get('clone-recursive', '').lower() == 'true':
-            subprocess.check_call(['git', 'clone', '--recursive', self.wrap.get('url'),
-                                   self.directory], cwd=self.subdir_root)
-        else:
-            subprocess.check_call(['git', 'clone', self.wrap.get('url'),
-                                   self.directory], cwd=self.subdir_root)
+        subprocess.check_call(['git', 'clone', self.wrap.get('url'),
+                               self.directory], cwd=self.subdir_root)
         if revno.lower() != 'head':
             if subprocess.call(['git', 'checkout', revno], cwd=self.dirname) != 0:
                 subprocess.check_call(['git', 'fetch', self.wrap.get('url'), revno], cwd=self.dirname)
-                subprocess.check_call(['git', 'checkout', revno],
-                                      cwd=self.dirname)
+                subprocess.check_call(['git', 'checkout', revno], cwd=self.dirname)
+        if self.wrap.values.get('clone-recursive', '').lower() == 'true':
+            subprocess.check_call(['git', 'submodule', 'update',
+                                   '--init', '--checkout', '--recursive'],
+                                  cwd=self.dirname)
         push_url = self.wrap.values.get('push-url')
         if push_url:
             subprocess.check_call(['git', 'remote', 'set-url',
@@ -349,7 +348,7 @@ class Resolver:
                 if os.path.exists(dst_file):
                     try:
                         os.remove(dst_file)
-                    except PermissionError as exc:
+                    except PermissionError:
                         os.chmod(dst_file, stat.S_IWUSR)
                         os.remove(dst_file)
                 shutil.copy2(src_file, dst_dir)

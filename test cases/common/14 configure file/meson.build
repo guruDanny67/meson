@@ -141,6 +141,19 @@ cfile = configure_file(input : 'config.h.in',
   install_dir : '',
   configuration : conf)
 
+# test install_dir : false (deprecated)
+cfile = configure_file(input : 'config.h.in',
+  output : 'do_not_get_installed_please.h',
+  install_dir : false,
+  configuration : conf)
+
+# test intsall_dir with install: false
+cfile = configure_file(input : 'config.h.in',
+  output : 'do_not_get_installed_in_install_dir.h',
+  install : false,
+  install_dir : 'share/appdir',
+  configuration : conf)
+
 # Test escaping with cmake format
 conf7 = configuration_data()
 conf7.set('var1', 'foo')

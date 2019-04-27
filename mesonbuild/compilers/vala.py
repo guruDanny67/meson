@@ -15,7 +15,7 @@
 import os.path
 
 from .. import mlog
-from ..mesonlib import EnvironmentException, version_compare
+from ..mesonlib import EnvironmentException, MachineChoice, version_compare
 
 from .compilers import Compiler
 
@@ -49,6 +49,12 @@ class ValaCompiler(Compiler):
     def get_pic_args(self):
         return []
 
+    def get_pie_args(self):
+        return []
+
+    def get_pie_link_args(self):
+        return []
+
     def get_always_args(self):
         return ['-C']
 
@@ -66,10 +72,31 @@ class ValaCompiler(Compiler):
             return ['--color=' + colortype]
         return []
 
+    def compute_parameters_with_absolute_paths(self, parameter_list, build_dir):
+        for idx, i in enumerate(parameter_list):
+            if i[:9] == '--girdir=':
+                parameter_list[idx] = i[:9] + os.path.normpath(os.path.join(build_dir, i[9:]))
+            if i[:10] == '--vapidir=':
+                parameter_list[idx] = i[:10] + os.path.normpath(os.path.join(build_dir, i[10:]))
+            if i[:13] == '--includedir=':
+                parameter_list[idx] = i[:13] + os.path.normpath(os.path.join(build_dir, i[13:]))
+            if i[:14] == '--metadatadir=':
+                parameter_list[idx] = i[:14] + os.path.normpath(os.path.join(build_dir, i[14:]))
+
+        return parameter_list
+
     def sanity_check(self, work_dir, environment):
         code = 'class MesonSanityCheck : Object { }'
-        args = self.get_cross_extra_flags(environment, link=False)
-        with self.compile(code, args, 'compile') as p:
+        if environment.is_cross_build() and not self.is_cross:
+            for_machine = MachineChoice.BUILD
+        else:
+            for_machine = MachineChoice.HOST
+        extra_flags = environment.coredata.get_external_args(for_machine, self.language)
+        if self.is_cross:
+            extra_flags += self.get_compile_only_args()
+        else:
+            extra_flags += environment.coredata.get_external_link_args(for_machine, self.language)
+        with self.compile(code, extra_flags, 'compile') as p:
             if p.returncode != 0:
                 msg = 'Vala compiler {!r} can not compile programs' \
                       ''.format(self.name_string())
@@ -80,15 +107,19 @@ class ValaCompiler(Compiler):
             return ['--debug']
         return []
 
-    def find_library(self, libname, env, extra_dirs):
+    def find_library(self, libname, env, extra_dirs, *args):
         if extra_dirs and isinstance(extra_dirs, str):
             extra_dirs = [extra_dirs]
         # Valac always looks in the default vapi dir, so only search there if
         # no extra dirs are specified.
         if not extra_dirs:
             code = 'class MesonFindLibrary : Object { }'
+            if env.is_cross_build() and not self.is_cross:
+                for_machine = MachineChoice.BUILD
+            else:
+                for_machine = MachineChoice.HOST
+            args = env.coredata.get_external_args(for_machine, self.language)
             vapi_args = ['--pkg', libname]
-            args = self.get_cross_extra_flags(env, link=False)
             args += vapi_args
             with self.compile(code, args, 'compile') as p:
                 if p.returncode == 0:

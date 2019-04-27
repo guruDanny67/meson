@@ -61,6 +61,17 @@ added methods.
 
 ### Methods
 
+#### `path()`
+
+```meson
+str py_installation.path()
+```
+
+*Added 0.50.0*
+
+Works like the path method of other `ExternalProgram` objects. Was not
+provided prior to 0.50.0 due to a bug.
+
 #### `extension_module()`
 
 ``` meson
@@ -220,7 +231,7 @@ It exposes the same methods as its parent class.
 [shared_module]: Reference-manual.md#shared_module
 [external program]: Reference-manual.md#external-program-object
 [dependency]: Reference-manual.md#dependency
-[install_data]: Reference-manual.md#install-data
-[configure_file]: Reference-manual.md#configure-file
+[install_data]: Reference-manual.md#install_data
+[configure_file]: Reference-manual.md#configure_file
 [dependency object]: Reference-manual.md#dependency-object
 [buildtarget object]: Reference-manual.md#build-target-object

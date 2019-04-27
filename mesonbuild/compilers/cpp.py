@@ -23,10 +23,12 @@ from .c import CCompiler, VisualStudioCCompiler, ClangClCCompiler
 from .compilers import (
     gnu_winlibs,
     msvc_winlibs,
+    CompilerType,
     ClangCompiler,
     GnuCompiler,
     ElbrusCompiler,
     IntelCompiler,
+    PGICompiler,
     ArmCompiler,
     ArmclangCompiler,
     CcrxCompiler,
@@ -113,8 +115,8 @@ class CPPCompiler(CCompiler):
             'gnu++17': 'gnu++1z'
         }
 
-        # Currently, remapping is only supported for Clang and GCC
-        assert(self.id in frozenset(['clang', 'gcc']))
+        # Currently, remapping is only supported for Clang, Elbrus and GCC
+        assert(self.id in frozenset(['clang', 'lcc', 'gcc']))
 
         if cpp_std not in CPP_FALLBACKS:
             # 'c++03' and 'c++98' don't have fallback types
@@ -133,7 +135,8 @@ class ClangCPPCompiler(ClangCompiler, CPPCompiler):
         CPPCompiler.__init__(self, exelist, version, is_cross, exe_wrapper, **kwargs)
         ClangCompiler.__init__(self, compiler_type)
         default_warn_args = ['-Wall', '-Winvalid-pch', '-Wnon-virtual-dtor']
-        self.warn_args = {'1': default_warn_args,
+        self.warn_args = {'0': [],
+                          '1': default_warn_args,
                           '2': default_warn_args + ['-Wextra'],
                           '3': default_warn_args + ['-Wextra', '-Wpedantic']}
 
@@ -164,7 +167,8 @@ class ArmclangCPPCompiler(ArmclangCompiler, CPPCompiler):
         CPPCompiler.__init__(self, exelist, version, is_cross, exe_wrapper, **kwargs)
         ArmclangCompiler.__init__(self, compiler_type)
         default_warn_args = ['-Wall', '-Winvalid-pch', '-Wnon-virtual-dtor']
-        self.warn_args = {'1': default_warn_args,
+        self.warn_args = {'0': [],
+                          '1': default_warn_args,
                           '2': default_warn_args + ['-Wextra'],
                           '3': default_warn_args + ['-Wextra', '-Wpedantic']}
 
@@ -192,7 +196,8 @@ class GnuCPPCompiler(GnuCompiler, CPPCompiler):
         CPPCompiler.__init__(self, exelist, version, is_cross, exe_wrap, **kwargs)
         GnuCompiler.__init__(self, compiler_type, defines)
         default_warn_args = ['-Wall', '-Winvalid-pch', '-Wnon-virtual-dtor']
-        self.warn_args = {'1': default_warn_args,
+        self.warn_args = {'0': [],
+                          '1': default_warn_args,
                           '2': default_warn_args + ['-Wextra'],
                           '3': default_warn_args + ['-Wextra', '-Wpedantic']}
 
@@ -232,6 +237,12 @@ class GnuCPPCompiler(GnuCompiler, CPPCompiler):
         return ['-lstdc++']
 
 
+class PGICPPCompiler(PGICompiler, CPPCompiler):
+    def __init__(self, exelist, version, is_cross, exe_wrapper=None, **kwargs):
+        CPPCompiler.__init__(self, exelist, version, is_cross, exe_wrapper, **kwargs)
+        PGICompiler.__init__(self, CompilerType.PGI_STANDARD)
+
+
 class ElbrusCPPCompiler(GnuCPPCompiler, ElbrusCompiler):
     def __init__(self, exelist, version, compiler_type, is_cross, exe_wrapper=None, defines=None, **kwargs):
         GnuCPPCompiler.__init__(self, exelist, version, compiler_type, is_cross, exe_wrapper, defines, **kwargs)
@@ -240,10 +251,13 @@ class ElbrusCPPCompiler(GnuCPPCompiler, ElbrusCompiler):
     # It does not support c++/gnu++ 17 and 1z, but still does support 0x, 1y, and gnu++98.
     def get_options(self):
         opts = CPPCompiler.get_options(self)
-        opts['cpp_std'] = coredata.UserComboOption('cpp_std', 'C++ language standard to use',
-                                                   ['none', 'c++98', 'c++03', 'c++0x', 'c++11', 'c++14', 'c++1y',
-                                                    'gnu++98', 'gnu++03', 'gnu++0x', 'gnu++11', 'gnu++14', 'gnu++1y'],
-                                                   'none')
+        opts.update({'cpp_std': coredata.UserComboOption('cpp_std', 'C++ language standard to use',
+                                                         ['none', 'c++98', 'c++03', 'c++0x', 'c++11', 'c++14', 'c++1y',
+                                                          'gnu++98', 'gnu++03', 'gnu++0x', 'gnu++11', 'gnu++14', 'gnu++1y'],
+                                                         'none'),
+                     'cpp_debugstl': coredata.UserBooleanOption('cpp_debugstl',
+                                                                'STL debug mode',
+                                                                False)})
         return opts
 
     # Elbrus C++ compiler does not have lchmod, but there is only linker warning, not compiler error.
@@ -264,7 +278,8 @@ class IntelCPPCompiler(IntelCompiler, CPPCompiler):
         self.lang_header = 'c++-header'
         default_warn_args = ['-Wall', '-w3', '-diag-disable:remark',
                              '-Wpch-messages', '-Wnon-virtual-dtor']
-        self.warn_args = {'1': default_warn_args,
+        self.warn_args = {'0': [],
+                          '1': default_warn_args,
                           '2': default_warn_args + ['-Wextra'],
                           '3': default_warn_args + ['-Wextra']}
 

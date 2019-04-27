@@ -15,6 +15,7 @@
 # Public symbols for compilers sub-package when using 'from . import compilers'
 __all__ = [
     'CompilerType',
+    'Compiler',
 
     'all_languages',
     'base_options',
@@ -61,6 +62,7 @@ __all__ = [
     'GnuDCompiler',
     'GnuFortranCompiler',
     'ElbrusFortranCompiler',
+    'FlangFortranCompiler',
     'GnuObjCCompiler',
     'GnuObjCPPCompiler',
     'IntelCompiler',
@@ -70,12 +72,15 @@ __all__ = [
     'JavaCompiler',
     'LLVMDCompiler',
     'MonoCompiler',
+    'CudaCompiler',
     'VisualStudioCsCompiler',
     'NAGFortranCompiler',
     'ObjCCompiler',
     'ObjCPPCompiler',
     'Open64FortranCompiler',
     'PathScaleFortranCompiler',
+    'PGICCompiler',
+    'PGICPPCompiler',
     'PGIFortranCompiler',
     'RustCompiler',
     'CcrxCCompiler',
@@ -91,6 +96,7 @@ __all__ = [
 # Bring symbols from each module into compilers sub-package namespace
 from .compilers import (
     CompilerType,
+    Compiler,
     all_languages,
     base_options,
     clib_langs,
@@ -124,6 +130,7 @@ from .c import (
     GnuCCompiler,
     ElbrusCCompiler,
     IntelCCompiler,
+    PGICCompiler,
     CcrxCCompiler,
     VisualStudioCCompiler,
 )
@@ -136,6 +143,7 @@ from .cpp import (
     GnuCPPCompiler,
     ElbrusCPPCompiler,
     IntelCPPCompiler,
+    PGICPPCompiler,
     CcrxCPPCompiler,
     VisualStudioCPPCompiler,
 )
@@ -146,11 +154,13 @@ from .d import (
     GnuDCompiler,
     LLVMDCompiler,
 )
+from .cuda import CudaCompiler
 from .fortran import (
     FortranCompiler,
     G95FortranCompiler,
     GnuFortranCompiler,
     ElbrusFortranCompiler,
+    FlangFortranCompiler,
     IntelFortranCompiler,
     NAGFortranCompiler,
     Open64FortranCompiler,

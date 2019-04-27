@@ -62,7 +62,7 @@ def process_submodules(dirname):
     module_file = os.path.join(dirname, '.gitmodules')
     if not os.path.exists(module_file):
         return
-    subprocess.check_call(['git', 'submodule', 'update', '--init'], cwd=dirname)
+    subprocess.check_call(['git', 'submodule', 'update', '--init', '--recursive'], cwd=dirname)
     for line in open(module_file):
         line = line.strip()
         if '=' not in line:
@@ -133,7 +133,7 @@ def create_dist_hg(dist_name, src_root, bld_root, dist_sub, dist_scripts):
     tarname = os.path.join(dist_sub, dist_name + '.tar')
     xzname = tarname + '.xz'
     subprocess.check_call(['hg', 'archive', '-R', src_root, '-S', '-t', 'tar', tarname])
-    if len(dist_scripts) > 0:
+    if dist_scripts:
         mlog.warning('dist scripts are not supported in Mercurial projects')
     with lzma.open(xzname, 'wb') as xf, open(tarname, 'rb') as tf:
         shutil.copyfileobj(tf, xf)
@@ -188,7 +188,8 @@ def run(args):
 
     dist_name = build.project_name + '-' + build.project_version
 
-    if os.path.isdir(os.path.join(src_root, '.git')):
+    _git = os.path.join(src_root, '.git')
+    if os.path.isdir(_git) or os.path.isfile(_git):
         names = create_dist_git(dist_name, src_root, bld_root, dist_sub, build.dist_scripts)
     elif os.path.isdir(os.path.join(src_root, '.hg')):
         names = create_dist_hg(dist_name, src_root, bld_root, dist_sub, build.dist_scripts)

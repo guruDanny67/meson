@@ -231,6 +231,11 @@ the `@variable@` syntax.
 - `input` the input file name. If it's not specified in configuration
   mode, all the variables in the `configuration:` object (see above)
   are written to the `output:` file.
+- `install` *(added 0.50.0)* When true, this generated file is installed during
+the install step, and `install_dir` must be set and not empty. When false, this
+generated file is not installed regardless of the value of `install_dir`.
+When omitted it defaults to true when `install_dir` is set and not empty,
+false otherwise.
 - `install_dir` the subdirectory to install the generated file to
   (e.g. `share/myproject`), if omitted or given the value of empty
   string, the file is not installed.
@@ -261,6 +266,9 @@ following.
 - `build_by_default` *(added 0.38)* causes, when set to true, to
   have this target be built by default, that is, when invoking plain
   `ninja`; the default value is false
+  *(changed in 0.50)* if `build_by_default` is explicitly set to false, `install`
+  will no longer override it. If `build_by_default` is not set, `install` will
+  still determine its default.
 - `build_always` (deprecated) if `true` this target is always considered out of
   date and is rebuilt every time.  Equivalent to setting both
   `build_always_stale` and `build_by_default` to true.
@@ -326,6 +334,7 @@ the following special string substitutions:
 - `@DEPFILE@` the full path to the dependency file passed to `depfile`
 - `@PLAINNAME@`: the input filename, without a path
 - `@BASENAME@`: the input filename, with extension removed
+- `@PRIVATE_DIR@`: path to a directory where the custom target must store all its intermediate files, available since 0.50.1
 
 The `depfile` keyword argument also accepts the `@BASENAME@` and `@PLAINNAME@`
 substitutions. *(since 0.47)*
@@ -448,7 +457,8 @@ Print the argument string and halts the build process.
     environment_object environment()
 ```
 
-Returns an empty [environment variable object](#environment-object).
+Returns an empty [environment variable object](#environment-object). Added in
+0.35.0.
 
 ### executable()
 
@@ -510,11 +520,18 @@ be passed to [shared and static libraries](#library).
   when this file changes.
 - `link_whole` links all contents of the given static libraries
   whether they are used by not, equivalent to the
-  `-Wl,--whole-archive` argument flag of GCC, available since
-  0.40.0. As of 0.41.0 if passed a list that list will be flattened.
+  `-Wl,--whole-archive` argument flag of GCC, available since 0.40.0.
+  As of 0.41.0 if passed a list that list will be flattened. Starting
+  from version 0.51.0 this argument also accepts outputs produced by
+  custom targets. The user must ensure that the output is a library in
+  the correct format.
 - `link_with`, one or more shared or static libraries (built by this
   project) that this target should be linked with, If passed a list
-  this list will be flattened as of 0.41.0.
+  this list will be flattened as of 0.41.0. Starting with version
+  0.51.0, the arguments can also be custom targets. In this case Meson
+  will assume that merely adding the output file in the linker command
+  line is sufficient to make linking work. If this is not sufficient,
+  then the build system writer must write all other steps manually.
 - `export_dynamic` when set to true causes the target's symbols to be
   dynamically exported, allowing modules built using the
   [`shared_module`](#shared_module) function to refer to functions,
@@ -565,6 +582,8 @@ be passed to [shared and static libraries](#library).
 - `d_module_versions` list of module version identifiers set when compiling D sources
 - `d_debug` list of module debug identifiers set when compiling D sources
 - `pie` *(added 0.49.0)* build a position-independent executable
+- `native`, is a boolean controlling whether the target is compiled for the
+  build or host machines. Defaults to false, building for the host machine.
 
 The list of `sources`, `objects`, and `dependencies` is always
 flattened, which means you can freely nest and add lists while
@@ -1047,8 +1066,9 @@ res2 = foo / bar
 ```
 
 Builds a library that is either static, shared or both depending on
-the value of `default_library` user option. You should use this
-instead of [`shared_library`](#shared_library),
+the value of `default_library` 
+user [option](https://mesonbuild.com/Builtin-options.html).
+You should use this instead of [`shared_library`](#shared_library),
 [`static_library`](#static_library) or
 [`both_libraries`](#both_libraries) most of the time. This allows you
 to toggle your entire project (including subprojects) from shared to
@@ -1107,8 +1127,8 @@ This function prints its argument to stdout prefixed with WARNING:.
 The first argument to this function must be a string defining the name
 of this project. It is followed by programming languages that the
 project uses. Supported values for languages are `c`, `cpp` (for
-`C++`), `d`, `objc`, `objcpp`, `fortran`, `java`, `cs` (for `C#`) and
-`vala`. In versions before `0.40.0` you must have at least one
+`C++`), `d`, `objc`, `objcpp`, `fortran`, `java`, `cs` (for `C#`),
+`vala` and `rust`. In versions before `0.40.0` you must have at least one
 language listed.
 
 The project name can be any string you want, it's not used for
@@ -1173,12 +1193,14 @@ and Meson will set three environment variables `MESON_SOURCE_ROOT`,
 directory, build directory and subdirectory the target was defined in,
 respectively.
 
-This function has one keyword argument.
+This function supports the following keyword arguments:
 
  - `check` takes a boolean. If `true`, the exit status code of the command will
    be checked, and the configuration will fail if it is non-zero. The default is
    `false`.
    Since 0.47.0
+ - `env` an [environment object](#environment-object) to use a custom environment
+   Since 0.50.0
 
 See also [External commands](External-commands.md).
 
@@ -1394,10 +1416,7 @@ executable to run.  The executable can be an [executable build target
 object](#build-target-object) returned by
 [`executable()`](#executable) or an [external program
 object](#external-program-object) returned by
-[`find_program()`](#find_program). The executable's exit code is used
-by the test harness to record the outcome of the test, for example
-exit code zero indicates success. For more on the Meson test harness
-protocol read [Unit Tests](Unit-tests.md).
+[`find_program()`](#find_program).
 
 Keyword arguments are the following:
 
@@ -1433,6 +1452,12 @@ Keyword arguments are the following:
   targets internally, e.g. plugins or globbing. Those targets are built
   before test is executed even if they have `build_by_default : false`.
   Since 0.46.0
+
+- `protocol` specifies how the test results are parsed and can be one
+  of `exitcode` (the executable's exit code is used by the test harness
+  to record the outcome of the test) or `tap` ([Test Anything
+  Protocol](https://www.testanything.org/)). For more on the Meson test
+  harness protocol read [Unit Tests](Unit-tests.md). Since 0.50.0
 
 Defined tests can be run in a backend-agnostic way by calling
 `meson test` inside the build dir, or by using backend-specific
@@ -1528,7 +1553,8 @@ the following methods.
   `MESON_SOURCE_ROOT` and `MESON_BUILD_ROOT` set.
 
 - `backend()` *(added 0.37.0)* returns a string representing the
-  current backend: `ninja`, `vs2010`, `vs2015`, `vs2017`, or `xcode`.
+  current backend: `ninja`, `vs2010`, `vs2015`, `vs2017`, `vs2019`,
+  or `xcode`.
 
 - `build_root()` returns a string with the absolute path to the build
   root directory. Note: this function will return the build root of
@@ -1709,7 +1735,9 @@ the following methods:
   instead of a not-found dependency. *Since 0.50.0* the `has_headers` keyword
   argument can be a list of header files that must be found as well, using
   `has_header()` method. All keyword arguments prefixed with `header_` will be
-  passed down to `has_header()` method with the prefix removed.
+  passed down to `has_header()` method with the prefix removed. *Since 0.51.0*
+  the `static` keyword (boolean) can be set to `true` to limit the search to
+  static libraries and `false` for dynamic/shared.
 
 - `first_supported_argument(list_of_strings)`, given a list of
   strings, returns the first argument that passes the `has_argument`
@@ -2007,11 +2035,13 @@ A build target is either an [executable](#executable),
   previous versions.  The default will eventually be changed to `true`
   in a future version.
 
-- `extract_objects()` returns an opaque value representing the
-  generated object files of arguments, usually used to take single
-  object files and link them to unit tests or to compile some source
-  files with custom flags. To use the object file(s) in another build
-  target, use the `objects:` keyword argument.
+- `extract_objects(source1, source2, ...)` takes as its arguments
+  a number of source files as [`string`](#string-object) or
+  [`files()`](#files) and returns an opaque value representing the
+  object files generated for those source files. This is typically used
+  to take single object files and link them to unit tests or to compile
+  some source files with custom flags. To use the object file(s)
+  in another build target, use the `objects:` keyword argument.
 
 - `full_path()` returns a full path pointing to the result target file.
   NOTE: In most cases using the object itself will do the same job as
@@ -2121,14 +2151,17 @@ an external dependency with the following methods:
    partial dependency with the same rules. So , given:
 
    ```meson
-   dep1 = declare_dependency(compiler_args : '-Werror=foo', link_with : 'libfoo')
-   dep2 = declare_dependency(compiler_args : '-Werror=bar', dependencies : dep1)
+   dep1 = declare_dependency(compile_args : '-Werror=foo', link_with : 'libfoo')
+   dep2 = declare_dependency(compile_args : '-Werror=bar', dependencies : dep1)
    dep3 = dep2.partial_dependency(compile_args : true)
    ```
 
    dep3 will add `['-Werror=foo', '-Werror=bar']` to the compiler args
    of any target it is added to, but libfoo will not be added to the
    link_args.
+   
+   *Note*: A bug present until 0.50.1 results in the above behavior
+   not working correctly.
 
    The following arguments will add the following attributes:
 
@@ -2165,7 +2198,7 @@ and has the following methods:
 This object is returned by [`environment()`](#environment) and stores
 detailed information about how environment variables should be set
 during tests. It should be passed as the `env` keyword argument to
-tests. It has the following methods.
+tests and other functions. It has the following methods.
 
 - `append(varname, value1, value2, ...)` appends the given values to
   the old value of the environment variable, e.g.  `env.append('FOO',
@@ -2242,7 +2275,8 @@ sample piece of code with [`compiler.run()`](#compiler-object) or
 [`run_command()`](#run_command). It has the following methods:
 
 - `compiled()` if true, the compilation succeeded, if false it did not
-  and the other methods return unspecified data
+  and the other methods return unspecified data. This is only available
+  for `compiler.run()` results.
 - `returncode()` the return code of executing the compiled binary
 - `stderr()` the standard error produced when the command was run
 - `stdout()` the standard out produced when the command was run

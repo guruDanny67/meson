@@ -66,7 +66,7 @@ class FakeCompilerOptions:
     def __init__(self):
         self.value = []
 
-def get_fake_options(prefix):
+def get_fake_options(prefix=''):
     import argparse
     opts = argparse.Namespace()
     opts.cross_file = None
@@ -76,9 +76,12 @@ def get_fake_options(prefix):
     opts.native_file = []
     return opts
 
-def get_fake_env(sdir, bdir, prefix):
-    env = Environment(sdir, bdir, get_fake_options(prefix))
-    env.coredata.compiler_options['c_args'] = FakeCompilerOptions()
+def get_fake_env(sdir='', bdir=None, prefix='', opts=None):
+    if opts is None:
+        opts = get_fake_options(prefix)
+    env = Environment(sdir, bdir, opts)
+    env.coredata.compiler_options.host['c_args'] = FakeCompilerOptions()
+    env.machines.host.cpu_family = 'x86_64' # Used on macOS inside find_library
     return env
 
 
@@ -211,6 +214,14 @@ def run_mtest_inprocess(commandlist):
         sys.stderr = old_stderr
     return returncode, mystdout.getvalue(), mystderr.getvalue()
 
+def clear_meson_configure_class_caches():
+    mesonbuild.compilers.CCompiler.library_dirs_cache = {}
+    mesonbuild.compilers.CCompiler.program_dirs_cache = {}
+    mesonbuild.compilers.CCompiler.find_library_cache = {}
+    mesonbuild.compilers.CCompiler.find_framework_cache = {}
+    mesonbuild.dependencies.PkgConfigDependency.pkgbin_cache = {}
+    mesonbuild.dependencies.PkgConfigDependency.class_pkgbin = mesonlib.PerMachine(None, None, None)
+
 def run_configure_inprocess(commandlist):
     old_stdout = sys.stdout
     sys.stdout = mystdout = StringIO()
@@ -221,6 +232,7 @@ def run_configure_inprocess(commandlist):
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
+        clear_meson_configure_class_caches()
     return returncode, mystdout.getvalue(), mystderr.getvalue()
 
 def run_configure_external(full_command):
@@ -280,7 +292,7 @@ def main():
         os.environ.pop('platform')
     # Run tests
     print(mlog.bold('Running unittests.').get_text(mlog.colorize_console))
-    print()
+    print(flush=True)
     # Can't pass arguments to unit tests, so set the backend to use in the environment
     env = os.environ.copy()
     env['MESON_UNIT_TEST_BACKEND'] = backend.name
@@ -313,7 +325,7 @@ def main():
         else:
             cross_test_args = mesonlib.python_command + ['run_cross_test.py']
             print(mlog.bold('Running armhf cross tests.').get_text(mlog.colorize_console))
-            print()
+            print(flush=True)
             cmd = cross_test_args + ['cross/ubuntu-armhf.txt']
             if options.failfast:
                 cmd += ['--failfast']
@@ -322,7 +334,7 @@ def main():
                 return returncode
             print(mlog.bold('Running mingw-w64 64-bit cross tests.')
                   .get_text(mlog.colorize_console))
-            print()
+            print(flush=True)
             cmd = cross_test_args + ['cross/linux-mingw-w64-64bit.txt']
             if options.failfast:
                 cmd += ['--failfast']

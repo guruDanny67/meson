@@ -38,11 +38,19 @@ test('OpenMP C++', execpp, env : env)
 
 
 if add_languages('fortran', required : false)
-  exef = executable('exef',
-    'main.f90',
-    dependencies : [openmp])
+  # Mixing compilers (msvc/clang with gfortran) does not seem to work on Windows.
+  if build_machine.system() != 'windows' or cc.get_id() == 'gnu'
+    exef = executable('exef',
+      'main.f90',
+      dependencies : [openmp])
+    test('OpenMP Fortran', exef, env : env)
 
-  test('OpenMP Fortran', execpp, env : env)
+    openmp_f = dependency('openmp', language : 'fortran')
+    exe_f = executable('exe_f',
+      'main.f90',
+      dependencies : [openmp_f])
+    test('OpenMP Fortran-specific', exe_f, env : env)
+  endif
 endif
 
 # Check we can apply a version constraint

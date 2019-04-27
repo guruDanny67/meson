@@ -24,7 +24,7 @@ sample output for a simple project.
       Option          Current Value Possible Values                                          Description
       ------          ------------- ---------------                                          -----------
       auto_features   auto          [enabled, disabled, auto]                                Override value of all 'auto' features
-      backend         ninja         [ninja, vs, vs2010, vs2015, vs2017, xcode]               Backend to use
+      backend         ninja         [ninja, vs, vs2010, vs2015, vs2017, vs2019, xcode]       Backend to use
       buildtype       release       [plain, debug, debugoptimized, release, minsize, custom] Build type to use
       debug           false         [true, false]                                            Debug
       default_library shared        [shared, static, both]                                   Default library type
@@ -33,7 +33,7 @@ sample output for a simple project.
       optimization    3             [0, g, 1, 2, 3, s]                                       Optimization level
       strip           false         [true, false]                                            Strip targets on install
       unity           off           [on, off, subprojects]                                   Unity build
-      warning_level   1             [1, 2, 3]                                                Compiler warning level to use
+      warning_level   1             [0, 1, 2, 3]                                             Compiler warning level to use
       werror          false         [true, false]                                            Treat warnings as errors
 
     Backend options:
@@ -60,7 +60,7 @@ sample output for a simple project.
       ------        ------------- ---------------                                                                                               -----------
       c_args        []                                                                                                                          Extra arguments passed to the C compiler
       c_link_args   []                                                                                                                          Extra arguments passed to the C linker
-      c_std         c99           [none, c89, c99, c11, gnu89, gnu99, gnu11]                                                                    C language standard to use
+      c_std         c99           [none, c89, c99, c11, c17, c18, gnu89, gnu99, gnu11, gnu17, gnu18]                                                                    C language standard to use
       cpp_args      []                                                                                                                          Extra arguments passed to the C++ compiler
       cpp_debugstl  false         [true, false]                                                                                                 STL debug mode
       cpp_link_args []                                                                                                                          Extra arguments passed to the C++ linker
@@ -111,3 +111,8 @@ you would issue the following command.
 Then you would run your build command (usually `ninja`), which would
 cause Meson to detect that the build setup has changed and do all the
 work required to bring your build tree up to date.
+
+Since 0.50.0, it is also possible to get a list of all build options
+by invoking `meson configure` with the project source directory or
+the path to the root `meson.build`. In this case, meson will print the
+default values of all options similar to the example output from above.

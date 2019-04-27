@@ -17,20 +17,27 @@ import os.path
 import importlib
 import traceback
 import argparse
+import codecs
+import shutil
 
 from . import mesonlib
 from . import mlog
-from . import mconf, minit, minstall, mintro, msetup, mtest, rewriter, msubprojects
+from . import mconf, minit, minstall, mintro, msetup, mtest, rewriter, msubprojects, munstable_coredata
 from .mesonlib import MesonException
 from .environment import detect_msys2_arch
 from .wrap import wraptool
 
 
+# Note: when adding arguments, please also add them to the completion
+# scripts in $MESONSRC/data/shell-completions/
 class CommandLineParser:
     def __init__(self):
+        self.term_width = shutil.get_terminal_size().columns
+        self.formater = lambda prog: argparse.HelpFormatter(prog, max_help_position=int(self.term_width / 2), width=self.term_width)
+
         self.commands = {}
         self.hidden_commands = []
-        self.parser = argparse.ArgumentParser(prog='meson')
+        self.parser = argparse.ArgumentParser(prog='meson', formatter_class=self.formater)
         self.subparsers = self.parser.add_subparsers(title='Commands',
                                                      description='If no command is specified it defaults to setup command.')
         self.add_command('setup', msetup.add_arguments, msetup.run,
@@ -51,33 +58,42 @@ class CommandLineParser:
                          help='Manage subprojects')
         self.add_command('help', self.add_help_arguments, self.run_help_command,
                          help='Print help of a subcommand')
+        self.add_command('rewrite', lambda parser: rewriter.add_arguments(parser, self.formater), rewriter.run,
+                         help='Modify the project definition')
 
         # Hidden commands
-        self.add_command('rewrite', rewriter.add_arguments, rewriter.run,
-                         help=argparse.SUPPRESS)
         self.add_command('runpython', self.add_runpython_arguments, self.run_runpython_command,
                          help=argparse.SUPPRESS)
+        self.add_command('unstable-coredata', munstable_coredata.add_arguments, munstable_coredata.run,
+                         help=argparse.SUPPRESS)
 
-    def add_command(self, name, add_arguments_func, run_func, help):
+    def add_command(self, name, add_arguments_func, run_func, help, aliases=None):
+        aliases = aliases or []
         # FIXME: Cannot have hidden subparser:
         # https://bugs.python.org/issue22848
         if help == argparse.SUPPRESS:
-            p = argparse.ArgumentParser(prog='meson ' + name)
+            p = argparse.ArgumentParser(prog='meson ' + name, formatter_class=self.formater)
             self.hidden_commands.append(name)
         else:
-            p = self.subparsers.add_parser(name, help=help)
+            p = self.subparsers.add_parser(name, help=help, aliases=aliases, formatter_class=self.formater)
         add_arguments_func(p)
         p.set_defaults(run_func=run_func)
-        self.commands[name] = p
+        for i in [name] + aliases:
+            self.commands[i] = p
 
     def add_runpython_arguments(self, parser):
+        parser.add_argument('-c', action='store_true', dest='eval_arg', default=False)
         parser.add_argument('script_file')
         parser.add_argument('script_args', nargs=argparse.REMAINDER)
 
     def run_runpython_command(self, options):
         import runpy
-        sys.argv[1:] = options.script_args
-        runpy.run_path(options.script_file, run_name='__main__')
+        if options.eval_arg:
+            exec(options.script_file)
+        else:
+            sys.argv[1:] = options.script_args
+            sys.path.insert(0, os.path.dirname(options.script_file))
+            runpy.run_path(options.script_file, run_name='__main__')
         return 0
 
     def add_help_arguments(self, parser):
@@ -94,7 +110,7 @@ class CommandLineParser:
         # If first arg is not a known command, assume user wants to run the setup
         # command.
         known_commands = list(self.commands.keys()) + ['-h', '--help']
-        if len(args) == 0 or args[0] not in known_commands:
+        if not args or args[0] not in known_commands:
             args = ['setup'] + args
 
         # Hidden commands have their own parser instead of using the global one
@@ -117,7 +133,7 @@ class CommandLineParser:
             if os.environ.get('MESON_FORCE_BACKTRACE'):
                 raise
             return 1
-        except Exception as e:
+        except Exception:
             if os.environ.get('MESON_FORCE_BACKTRACE'):
                 raise
             traceback.print_exc()
@@ -148,12 +164,28 @@ def run_script_command(script_name, script_args):
         mlog.exception(e)
         return 1
 
+def ensure_stdout_accepts_unicode():
+    if sys.stdout.encoding and not sys.stdout.encoding.upper().startswith('UTF-'):
+        if sys.version_info >= (3, 7):
+            sys.stdout.reconfigure(errors='surrogateescape')
+        else:
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach(),
+                                                   errors='surrogateescape')
+            sys.stdout.encoding = 'UTF-8'
+            if not hasattr(sys.stdout, 'buffer'):
+                sys.stdout.buffer = sys.stdout.raw if hasattr(sys.stdout, 'raw') else sys.stdout
+
 def run(original_args, mainfile):
     if sys.version_info < (3, 5):
         print('Meson works correctly only with python 3.5+.')
         print('You have python %s.' % sys.version)
         print('Please update your environment')
         return 1
+
+    # Meson gets confused if stdout can't output Unicode, if the
+    # locale isn't Unicode, just force stdout to accept it. This tries
+    # to emulate enough of PEP 540 to work elsewhere.
+    ensure_stdout_accepts_unicode()
 
     # https://github.com/mesonbuild/meson/issues/3653
     if sys.platform.lower() == 'msys':

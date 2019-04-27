@@ -30,6 +30,7 @@ index.md
 		Subprojects.md
 		Disabler.md
 		Modules.md
+			CMake-module.md
 			Dlang-module.md
 			Gnome-module.md
 			Hotdoc-module.md
@@ -43,6 +44,8 @@ index.md
 			RPM-module.md
 			Simd-module.md
 			Windows-module.md
+			Cuda-module.md
+			Kconfig-module.md
 		Java.md
 		Vala.md
 		D.md
@@ -58,6 +61,7 @@ index.md
 	Reference-manual.md
 	Reference-tables.md
 	Style-guide.md
+	Rewriter.md
 	FAQ.md
 	Reproducible-builds.md
 	howtox.md

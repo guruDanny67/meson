@@ -18,7 +18,7 @@
 from . import mparser, mesonlib, mlog
 from . import environment, dependencies
 
-import os, copy, re, types
+import os, copy, re
 from functools import wraps
 
 class ObjectHolder:
@@ -47,14 +47,14 @@ def _get_callee_args(wrapped_args, want_subproject=False):
     if want_subproject and n == 2:
         if hasattr(s, 'subproject'):
             # Interpreter base types have 2 args: self, node
-            node_or_state = wrapped_args[1]
+            node = wrapped_args[1]
             # args and kwargs are inside the node
             args = None
             kwargs = None
             subproject = s.subproject
         elif hasattr(wrapped_args[1], 'subproject'):
             # Module objects have 2 args: self, interpreter
-            node_or_state = wrapped_args[1]
+            node = wrapped_args[1].current_node
             # args and kwargs are inside the node
             args = None
             kwargs = None
@@ -63,7 +63,7 @@ def _get_callee_args(wrapped_args, want_subproject=False):
             raise AssertionError('Unknown args: {!r}'.format(wrapped_args))
     elif n == 3:
         # Methods on objects (*Holder, MesonMain, etc) have 3 args: self, args, kwargs
-        node_or_state = None # FIXME
+        node = s.current_node
         args = wrapped_args[1]
         kwargs = wrapped_args[2]
         if want_subproject:
@@ -73,30 +73,32 @@ def _get_callee_args(wrapped_args, want_subproject=False):
                 subproject = s.interpreter.subproject
     elif n == 4:
         # Meson functions have 4 args: self, node, args, kwargs
-        # Module functions have 4 args: self, state, args, kwargs; except,
-        # PythonInstallation methods have self, interpreter, args, kwargs
-        node_or_state = wrapped_args[1]
+        # Module functions have 4 args: self, state, args, kwargs
+        if isinstance(s, InterpreterBase):
+            node = wrapped_args[1]
+        else:
+            node = wrapped_args[1].current_node
         args = wrapped_args[2]
         kwargs = wrapped_args[3]
         if want_subproject:
             if isinstance(s, InterpreterBase):
                 subproject = s.subproject
             else:
-                subproject = node_or_state.subproject
+                subproject = wrapped_args[1].subproject
     elif n == 5:
         # Module snippets have 5 args: self, interpreter, state, args, kwargs
-        node_or_state = wrapped_args[2]
+        node = wrapped_args[2].current_node
         args = wrapped_args[3]
         kwargs = wrapped_args[4]
         if want_subproject:
-            subproject = node_or_state.subproject
+            subproject = wrapped_args[2].subproject
     else:
         raise AssertionError('Unknown args: {!r}'.format(wrapped_args))
     # Sometimes interpreter methods are called internally with None instead of
     # empty list/dict
     args = args if args is not None else []
     kwargs = kwargs if kwargs is not None else {}
-    return s, node_or_state, args, kwargs, subproject
+    return s, node, args, kwargs, subproject
 
 def flatten(args):
     if isinstance(args, mparser.StringNode):
@@ -164,19 +166,10 @@ class permittedKwargs:
     def __call__(self, f):
         @wraps(f)
         def wrapped(*wrapped_args, **wrapped_kwargs):
-            s, node_or_state, args, kwargs, _ = _get_callee_args(wrapped_args)
-            loc = types.SimpleNamespace()
-            if hasattr(s, 'subdir'):
-                loc.subdir = s.subdir
-                loc.lineno = s.current_lineno
-            elif node_or_state and hasattr(node_or_state, 'subdir'):
-                loc.subdir = node_or_state.subdir
-                loc.lineno = node_or_state.current_lineno
-            else:
-                loc = None
+            s, node, args, kwargs, _ = _get_callee_args(wrapped_args)
             for k in kwargs:
                 if k not in self.permitted:
-                    mlog.warning('''Passed invalid keyword argument "{}".'''.format(k), location=loc)
+                    mlog.warning('''Passed invalid keyword argument "{}".'''.format(k), location=node)
                     mlog.warning('This will become a hard error in the future.')
             return f(*wrapped_args, **wrapped_kwargs)
         return wrapped
@@ -320,6 +313,9 @@ class BreakRequest(BaseException):
 class InterpreterObject:
     def __init__(self):
         self.methods = {}
+        # Current node set during a method call. This can be used as location
+        # when printing a warning message during a method call.
+        self.current_node = None
 
     def method_call(self, method_name, args, kwargs):
         if method_name in self.methods:
@@ -366,6 +362,9 @@ class InterpreterBase:
         self.variables = {}
         self.argument_depth = 0
         self.current_lineno = -1
+        # Current node set during a function call. This can be used as location
+        # when printing a warning message during a method call.
+        self.current_node = None
 
     def load_root_meson_file(self):
         mesonfile = os.path.join(self.source_root, self.subdir, environment.build_filename)
@@ -607,6 +606,23 @@ The result of this is undefined and will become a hard error in a future Meson r
             raise InterpreterException('Argument to negation is not an integer.')
         return -v
 
+    @FeatureNew('/ with string arguments', '0.49.0')
+    def evaluate_path_join(self, l, r):
+        if not isinstance(l, str):
+            raise InvalidCode('The division operator can only append to a string.')
+        if not isinstance(r, str):
+            raise InvalidCode('The division operator can only append a string.')
+        return self.join_path_strings((l, r))
+
+    def evaluate_division(self, l, r):
+        if isinstance(l, str) or isinstance(r, str):
+            return self.evaluate_path_join(l, r)
+        if isinstance(l, int) and isinstance(r, int):
+            if r == 0:
+                raise InvalidCode('Division by zero.')
+            return l // r
+        raise InvalidCode('Division works only with strings or integers.')
+
     def evaluate_arithmeticstatement(self, cur):
         l = self.evaluate_statement(cur.left)
         if is_disabler(l):
@@ -631,13 +647,7 @@ The result of this is undefined and will become a hard error in a future Meson r
                 raise InvalidCode('Multiplication works only with integers.')
             return l * r
         elif cur.operation == 'div':
-            if isinstance(l, str) and isinstance(r, str):
-                return self.join_path_strings((l, r))
-            if isinstance(l, int) and isinstance(r, int):
-                if r == 0:
-                    raise InvalidCode('Division by zero.')
-                return l // r
-            raise InvalidCode('Division works only with strings or integers.')
+            return self.evaluate_division(l, r)
         elif cur.operation == 'mod':
             if not isinstance(l, int) or not isinstance(r, int):
                 raise InvalidCode('Modulo works only with integers.')
@@ -749,7 +759,6 @@ The result of this is undefined and will become a hard error in a future Meson r
             except IndexError:
                 raise InterpreterException('Index %d out of bounds of array of size %d.' % (index, len(iobject)))
 
-
     def function_call(self, node):
         func_name = node.func_name
         (posargs, kwargs) = self.reduce_arguments(node.args)
@@ -760,6 +769,7 @@ The result of this is undefined and will become a hard error in a future Meson r
             if not getattr(func, 'no-args-flattening', False):
                 posargs = flatten(posargs)
 
+            self.current_node = node
             return func(node, posargs, kwargs)
         else:
             self.unknown_function_called(func_name)
@@ -796,6 +806,7 @@ The result of this is undefined and will become a hard error in a future Meson r
             return Disabler()
         if method_name == 'extract_objects':
             self.validate_extraction(obj.held_object)
+        obj.current_node = node
         return obj.method_call(method_name, args, kwargs)
 
     def bool_method_call(self, obj, method_name, args):
@@ -908,6 +919,24 @@ The result of this is undefined and will become a hard error in a future Meson r
                 raise InterpreterException('Version_compare() argument must be a string.')
             return mesonlib.version_compare(obj, cmpr)
         raise InterpreterException('Unknown method "%s" for a string.' % method_name)
+
+    def format_string(self, templ, args):
+        if isinstance(args, mparser.ArgumentNode):
+            args = args.arguments
+        arg_strings = []
+        for arg in args:
+            arg = self.evaluate_statement(arg)
+            if isinstance(arg, bool): # Python boolean is upper case.
+                arg = str(arg).lower()
+            arg_strings.append(str(arg))
+
+        def arg_replace(match):
+            idx = int(match.group(1))
+            if idx >= len(arg_strings):
+                raise InterpreterException('Format placeholder @{}@ out of range.'.format(idx))
+            return arg_strings[idx]
+
+        return re.sub(r'@(\d+)@', arg_replace, templ)
 
     def unknown_function_called(self, func_name):
         raise InvalidCode('Unknown function "%s".' % func_name)

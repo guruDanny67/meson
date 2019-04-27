@@ -23,6 +23,8 @@ from . import ModuleReturnValue
 from . import ExtensionModule
 from ..interpreterbase import permittedKwargs, FeatureNew, FeatureNewKwargs
 
+already_warned_objs = set()
+
 class DependenciesHelper:
     def __init__(self, name):
         self.name = name
@@ -51,16 +53,21 @@ class DependenciesHelper:
         self.priv_reqs += self._process_reqs(reqs)
 
     def _check_generated_pc_deprecation(self, obj):
-        if hasattr(obj, 'generated_pc_warn'):
-            mlog.deprecation('Library', mlog.bold(obj.name), 'was passed to the '
-                             '"libraries" keyword argument of a previous call '
-                             'to generate() method instead of first positional '
-                             'argument.', 'Adding', mlog.bold(obj.generated_pc),
-                             'to "Requires" field, but this is a deprecated '
-                             'behaviour that will change in a future version '
-                             'of Meson. Please report the issue if this '
-                             'warning cannot be avoided in your case.',
-                             location=obj.generated_pc_warn)
+        if not hasattr(obj, 'generated_pc_warn'):
+            return
+        name = obj.generated_pc_warn[0]
+        if (name, obj.name) in already_warned_objs:
+            return
+        mlog.deprecation('Library', mlog.bold(obj.name), 'was passed to the '
+                         '"libraries" keyword argument of a previous call '
+                         'to generate() method instead of first positional '
+                         'argument.', 'Adding', mlog.bold(obj.generated_pc),
+                         'to "Requires" field, but this is a deprecated '
+                         'behaviour that will change in a future version '
+                         'of Meson. Please report the issue if this '
+                         'warning cannot be avoided in your case.',
+                         location=obj.generated_pc_warn[1])
+        already_warned_objs.add((name, obj.name))
 
     def _process_reqs(self, reqs):
         '''Returns string names of requirements'''
@@ -192,7 +199,11 @@ class DependenciesHelper:
             for x in xs:
                 # Don't de-dup unknown strings to avoid messing up arguments like:
                 # ['-framework', 'CoreAudio', '-framework', 'CoreMedia']
-                if x not in result or (libs and (isinstance(x, str) and not x.endswith(('-l', '-L')))):
+                known_flags = ['-pthread']
+                cannot_dedup = libs and isinstance(x, str) and \
+                    not x.startswith(('-l', '-L')) and \
+                    x not in known_flags
+                if x not in result or cannot_dedup:
                     result.append(x)
             return result
         self.pub_libs = _fn(self.pub_libs, True)
@@ -235,7 +246,7 @@ class PkgConfigModule(ExtensionModule):
         # https://bugs.freedesktop.org/show_bug.cgi?id=103203
         if isinstance(value, PurePath):
             value = value.as_posix()
-        return value.replace(' ', '\ ')
+        return value.replace(' ', r'\ ')
 
     def _make_relative(self, prefix, subdir):
         if isinstance(prefix, PurePath):
@@ -342,7 +353,9 @@ class PkgConfigModule(ExtensionModule):
         default_description = None
         default_name = None
         mainlib = None
-        if len(args) == 1:
+        if not args and 'version' not in kwargs:
+            FeatureNew('pkgconfig.generate implicit version keyword', '0.46.0').use(state.subproject)
+        elif len(args) == 1:
             FeatureNew('pkgconfig.generate optional positional argument', '0.46.0').use(state.subproject)
             mainlib = getattr(args[0], 'held_object', args[0])
             if not isinstance(mainlib, (build.StaticLibrary, build.SharedLibrary)):
@@ -434,11 +447,13 @@ class PkgConfigModule(ExtensionModule):
                 mainlib.generated_pc = filebase
             else:
                 mlog.warning('Already generated a pkg-config file for', mlog.bold(mainlib.name))
-        for lib in deps.pub_libs:
-            if not isinstance(lib, str) and not hasattr(lib, 'generated_pc'):
-                lib.generated_pc = filebase
-                lib.generated_pc_warn = types.SimpleNamespace(subdir=state.subdir,
-                                                              lineno=state.current_lineno)
+        else:
+            for lib in deps.pub_libs:
+                if not isinstance(lib, str) and not hasattr(lib, 'generated_pc'):
+                    lib.generated_pc = filebase
+                    location = types.SimpleNamespace(subdir=state.subdir,
+                                                     lineno=state.current_lineno)
+                    lib.generated_pc_warn = [name, location]
         return ModuleReturnValue(res, [res])
 
 def initialize(*args, **kwargs):

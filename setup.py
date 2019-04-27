@@ -28,13 +28,14 @@ from setuptools import setup
 # Other platforms will create bin/meson
 entries = {'console_scripts': ['meson=mesonbuild.mesonmain:main']}
 packages = ['mesonbuild',
+            'mesonbuild.ast',
             'mesonbuild.backend',
             'mesonbuild.compilers',
             'mesonbuild.dependencies',
             'mesonbuild.modules',
             'mesonbuild.scripts',
             'mesonbuild.wrap']
-package_data = {'mesonbuild.dependencies': ['data/CMakeLists.txt']}
+package_data = {'mesonbuild.dependencies': ['data/CMakeLists.txt', 'data/CMakePathInfo.txt']}
 data_files = []
 if sys.platform != 'win32':
     # Only useful on UNIX-like systems

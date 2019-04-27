@@ -14,7 +14,9 @@
 
 import os.path, subprocess
 
-from ..mesonlib import EnvironmentException, version_compare, is_windows, is_osx
+from ..mesonlib import (
+    EnvironmentException, MachineChoice, version_compare, is_windows, is_osx
+)
 
 from .compilers import (
     CompilerType,
@@ -110,6 +112,19 @@ class DCompiler(Compiler):
 
     def get_include_args(self, path, is_system):
         return ['-I=' + path]
+
+    def compute_parameters_with_absolute_paths(self, parameter_list, build_dir):
+        for idx, i in enumerate(parameter_list):
+            if i[:3] == '-I=':
+                parameter_list[idx] = i[:3] + os.path.normpath(os.path.join(build_dir, i[3:]))
+            if i[:4] == '-L-L':
+                parameter_list[idx] = i[:4] + os.path.normpath(os.path.join(build_dir, i[4:]))
+            if i[:5] == '-L=-L':
+                parameter_list[idx] = i[:5] + os.path.normpath(os.path.join(build_dir, i[5:]))
+            if i[:6] == '-Wl,-L':
+                parameter_list[idx] = i[:6] + os.path.normpath(os.path.join(build_dir, i[6:]))
+
+        return parameter_list
 
     def get_warn_args(self, level):
         return ['-wi']
@@ -293,12 +308,17 @@ class DCompiler(Compiler):
                 # Add link flags needed to find dependencies
                 args += d.get_link_args()
 
+        if env.is_cross_build() and not self.is_cross:
+            for_machine = MachineChoice.BUILD
+        else:
+            for_machine = MachineChoice.HOST
+
         if mode == 'compile':
             # Add DFLAGS from the env
-            args += env.coredata.get_external_args(self.language)
+            args += env.coredata.get_external_args(for_machine, self.language)
         elif mode == 'link':
             # Add LDFLAGS from the env
-            args += env.coredata.get_external_link_args(self.language)
+            args += env.coredata.get_external_link_args(for_machine, self.language)
         # extra_args must override all other arguments, so we add them last
         args += extra_args
         return args
@@ -360,7 +380,18 @@ class DCompiler(Compiler):
                 # translate library link flag
                 dcargs.append('-L=' + arg)
                 continue
-            elif arg.startswith('-L'):
+            elif arg.startswith('-isystem'):
+                # translate -isystem system include path
+                # this flag might sometimes be added by C library Cflags via
+                # pkg-config.
+                # NOTE: -isystem and -I are not 100% equivalent, so this is just
+                # a workaround for the most common cases.
+                if arg.startswith('-isystem='):
+                    dcargs.append('-I=' + arg[9:])
+                else:
+                    dcargs.append('-I')
+                continue
+            elif arg.startswith('-L/') or arg.startswith('-L./'):
                 # we need to handle cases where -L is set by e.g. a pkg-config
                 # setting to select a linker search path. We can however not
                 # unconditionally prefix '-L' with '-L' because the user might
@@ -467,7 +498,8 @@ class GnuDCompiler(DCompiler):
         DCompiler.__init__(self, exelist, version, is_cross, arch, **kwargs)
         self.id = 'gcc'
         default_warn_args = ['-Wall', '-Wdeprecated']
-        self.warn_args = {'1': default_warn_args,
+        self.warn_args = {'0': [],
+                          '1': default_warn_args,
                           '2': default_warn_args + ['-Wextra'],
                           '3': default_warn_args + ['-Wextra', '-Wpedantic']}
         self.base_options = ['b_colorout', 'b_sanitize', 'b_staticpic', 'b_vscrt']
@@ -511,6 +543,13 @@ class GnuDCompiler(DCompiler):
     def get_buildtype_args(self, buildtype):
         return d_gdc_buildtype_args[buildtype]
 
+    def compute_parameters_with_absolute_paths(self, parameter_list, build_dir):
+        for idx, i in enumerate(parameter_list):
+            if i[:2] == '-I' or i[:2] == '-L':
+                parameter_list[idx] = i[:2] + os.path.normpath(os.path.join(build_dir, i[2:]))
+
+        return parameter_list
+
     def build_rpath_args(self, build_dir, from_dir, rpath_paths, build_rpath, install_rpath):
         return self.build_unix_rpath_args(build_dir, from_dir, rpath_paths, build_rpath, install_rpath)
 
@@ -531,8 +570,10 @@ class LLVMDCompiler(DCompiler):
     def get_warn_args(self, level):
         if level == '2' or level == '3':
             return ['-wi', '-dw']
-        else:
+        elif level == '1':
             return ['-wi']
+        else:
+            return []
 
     def get_buildtype_args(self, buildtype):
         if buildtype != 'plain':
@@ -581,7 +622,15 @@ class DmdDCompiler(DCompiler):
         return []
 
     def get_std_shared_lib_link_args(self):
-        return ['-shared', '-defaultlib=libphobos2.so']
+        libname = 'libphobos2.so'
+        if is_windows():
+            if self.arch == 'x86_64':
+                libname = 'phobos64.lib'
+            elif self.arch == 'x86_mscoff':
+                libname = 'phobos32mscoff.lib'
+            else:
+                libname = 'phobos.lib'
+        return ['-shared', '-defaultlib=' + libname]
 
     def get_target_arch_args(self):
         # DMD32 and DMD64 on 64-bit Windows defaults to 32-bit (OMF).
